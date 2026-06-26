@@ -1474,16 +1474,12 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
-  it("defaults resumed subagents to auto-exit and non-interactive tracking", () => {
+  it("always resumes subagents as autonomous (auto-exit, non-interactive tracking)", () => {
     const testApi = (subagentsModule as any).__test__;
 
-    assert.deepEqual(testApi.resolveResumeLaunchBehavior({}), {
+    assert.deepEqual(testApi.resolveResumeLaunchBehavior(), {
       autoExit: true,
       interactive: false,
-    });
-    assert.deepEqual(testApi.resolveResumeLaunchBehavior({ autoExit: false }), {
-      autoExit: false,
-      interactive: true,
     });
   });
 
@@ -1561,7 +1557,7 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers subagent_message with name, sessionId, message, and an autoExit override", () => {
+  it("registers subagent_message with only name, sessionId, and required message (no autoExit knob)", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1569,14 +1565,14 @@ describe("tool registration", () => {
     assert.ok(messageTool, "expected subagent_message tool to be registered");
 
     const props = messageTool.parameters.properties;
-    assert.ok(props.name, "expected name param");
-    assert.ok(props.sessionId, "expected sessionId param");
+    assert.deepEqual(
+      Object.keys(props).sort(),
+      ["message", "name", "sessionId"],
+      "only name/sessionId/message should remain",
+    );
     assert.equal(props.message.type, "string");
     assert.equal(messageTool.parameters.required?.includes("message"), true);
-
-    const autoExitSchema = props.autoExit;
-    assert.equal(autoExitSchema.type, "boolean");
-    assert.match(autoExitSchema.description, /Defaults to true/);
+    assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
 
   it("no longer registers subagent_interrupt or subagent_resume", () => {

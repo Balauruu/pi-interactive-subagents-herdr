@@ -189,7 +189,7 @@ The message is delivered into the child's TUI editor (newlines are flattened to 
 subagent_message({ sessionId: "019f05b2-f1c3", message: "Now write the tests too" });
 ```
 
-Resuming is fire-and-forget async: the relaunched session's result is delivered later as a steer message, exactly like a fresh `subagent` spawn.
+Resuming is fire-and-forget async: the relaunched session always runs its follow-up task autonomously and its result is delivered later as a steer message, exactly like a fresh `subagent` spawn. (There is no per-call behavior knob — resume is always autonomous, matching this result-delivery model.)
 
 > **Guard:** a `sessionId` that maps to a still-running subagent is rejected — resuming would launch a second process mutating the same session file. Steer it by `name` instead. There is no hard-abort tool; to forcibly stop a subagent, use its pane directly.
 
@@ -197,7 +197,6 @@ Resuming is fire-and-forget async: the relaunched session's result is delivered 
 - `name` — exact display name of a running subagent to steer (mutually exclusive with `sessionId`)
 - `sessionId` — id (or id prefix) of a finished session to resume (mutually exclusive with `name`)
 - `message` (required) — the instruction or next task to deliver
-- `autoExit` (resume only) — whether the resumed session auto-exits after its next response. Defaults to `true`; set `false` for an interactive handoff.
 
 ---
 

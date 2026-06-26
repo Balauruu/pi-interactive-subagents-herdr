@@ -997,9 +997,12 @@ function startStatusRefresh(pi: ExtensionAPI) {
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
-function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit: boolean; interactive: boolean } {
-  const autoExit = params.autoExit ?? true;
-  return { autoExit, interactive: !autoExit };
+// Resuming a finished session is always autonomous: the relaunched agent runs
+// its follow-up task to completion and the harness delivers the result as a
+// steer message (fire-and-forget). An interactive resume would park the pane
+// waiting for the user, contradicting that result-delivery model.
+function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolean } {
+  return { autoExit: true, interactive: false };
 }
 
 export const __test__ = {
@@ -1889,12 +1892,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           description:
             "The message to deliver: a follow-up instruction for a running subagent, or the next task for a resumed session.",
         }),
-        autoExit: Type.Optional(
-          Type.Boolean({
-            description:
-              "Resume only: whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
-          }),
-        ),
       }),
 
       renderCall(args, theme) {
@@ -1958,8 +1955,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // ── Resume a finished session ──
         const requestedId = params.sessionId!.trim();
         const message = params.message;
-        const name = params.name ?? "Resume";
-        const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
+        const name = "Resume";
+        const { autoExit, interactive } = resolveResumeLaunchBehavior();
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
