@@ -62,7 +62,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 4 main-session tools + 1 command, plus 1 subagent-only tool:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -73,19 +73,17 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
-| `/plan`                    | Start a full planning workflow       |
-| `/iterate`                 | Fork into a subagent for quick fixes |
 | `/subagent <agent> <task>` | Spawn a named agent directly         |
 
 ### Bundled Agents
 
-| Agent             | Model                  | Role                                                                                     |
-| ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Haiku                  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| Agent          | Model  | Tools                                            | Role                                                              |
+| -------------- | ------ | ------------------------------------------------ | ----------------------------------------------------------------- |
+| **scout**      | Haiku  | `read`, `grep`, `find`, `ls`                     | Fast read-only codebase recon — maps files, patterns, conventions |
+| **researcher** | Sonnet | `web_search`, `web_fetch`                        | Web research — searches and synthesizes a sourced brief           |
+| **worker**     | Sonnet | `read`, `write`, `edit`, `safe_bash`, `web_search`, `web_fetch` + spawning | General implementer — writes code, runs commands; may dispatch `scout`/`researcher` to protect its context |
+
+The **worker** is the only bundled agent granted the spawning toolset, and it may only spawn `scout` and `researcher` (see [`subagent_agents`](#subagent_agents)). `scout` and `researcher` are autonomous (`auto-exit: true`); `worker` runs interactively.
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 
@@ -125,7 +123,7 @@ The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot
 
 These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
-**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `worker`, or any `fork: true` spawn) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
 #### Configuration
 
@@ -154,10 +152,10 @@ cp config.json.example config.json
 subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 
 // Force a full-context fork for this spawn
-subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." });
+subagent({ name: "Fix", fork: true, task: "Fix the bug where..." });
 
-// Agent defaults can choose a different session-mode via frontmatter
-subagent({ name: "Planner", agent: "planner", task: "Work through the design with me" });
+// Interactive worker the user can drive in its own pane
+subagent({ name: "Worker", agent: "worker", task: "Implement the dark mode toggle" });
 
 // Custom working directory
 subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
@@ -232,43 +230,6 @@ await caller_ping({
 
 ---
 
-## The `/plan` Workflow
-
-The `/plan` command orchestrates a full planning-to-implementation pipeline.
-
-```
-/plan Add a dark mode toggle to the settings page
-```
-
-```
-Phase 1: Investigation    → Quick codebase scan
-Phase 2: Planning         → Interactive planner subagent (user collaborates)
-Phase 3: Review Plan      → Confirm todos, adjust if needed
-Phase 4: Execute          → Scout + sequential workers implement todos
-Phase 5: Review           → Reviewer subagent checks all changes
-```
-
-Tab/window titles update to show current phase:
-
-```
-🔍 Investigating: dark mode → 💬 Planning: dark mode
-→ 🔨 Executing: 1/3 → 🔎 Reviewing → ✅ Done
-```
-
----
-
-## The `/iterate` Workflow
-
-For quick, focused work without polluting the main session's context.
-
-```
-/iterate Fix the off-by-one error in the pagination logic
-```
-
-This always forks the current session into a subagent with full conversation context. It does not inherit an agent default `session-mode`. Make the fix, verify it, and exit to return. The main session gets a summary of what was done.
-
----
-
 ## Custom Agents
 
 Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global):
@@ -279,15 +240,16 @@ name: my-agent
 description: Does something specific
 model: anthropic/claude-sonnet-4-6
 thinking: minimal
-tools: read, bash, edit, write
+tools: read, edit, write, safe_bash, web_search
 session-mode: lineage-only
-spawning: false
 ---
 
 # My Agent
 
 You are a specialized agent that does X...
 ```
+
+The `tools` field is a strict allowlist. The child process is launched with extension discovery disabled (`--no-extensions`) and only the extensions backing the listed tools are loaded back in. An agent that lists no spawning tools and no `subagent_agents` simply cannot spawn anything.
 
 ### Frontmatter Reference
 
@@ -297,12 +259,11 @@ You are a specialized agent that does X...
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
-| `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
+| `tools`       | string  | Strict allowlist of tool names. Built-ins (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) plus custom-extension tools (`web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`). Only the extensions backing these tools are loaded into the child. |
+| `subagent_agents` | string | Comma-separated list of agent names this agent may spawn. **Presence of this field grants the full spawning toolset** (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`) and restricts spawn targets to the listed agents. Omit it and the agent cannot spawn at all. |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
-| `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
-| `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, researcher); not for interactive ones (worker). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -321,11 +282,11 @@ Choose how a subagent session starts:
 
 `lineage-only` is useful when you want session discovery and fork lineage UX to show the relationship later, but you do **not** want the child to inherit the parent's turns.
 
-`fork: true` on the tool call always forces the `fork` mode for that specific spawn. `/iterate` uses this explicit override on purpose.
+`fork: true` on the tool call always forces the `fork` mode for that specific spawn.
 
 ```yaml
 ---
-name: planner
+name: worker
 session-mode: lineage-only
 ---
 ```
@@ -342,8 +303,8 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 
 **When to use:**
 
-- ✅ Autonomous agents (scout, worker, reviewer) that run to completion
-- ❌ Interactive agents (planner, iterate) where the user drives the session
+- ✅ Autonomous agents (scout, researcher) that run to completion
+- ❌ Interactive agents (worker) where the user drives the session
 
 ```yaml
 ---
@@ -356,7 +317,7 @@ auto-exit: true
 
 Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
 
-**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. `/iterate` with `fork: true`) are treated as interactive.
+**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. a `fork: true` spawn) are treated as interactive.
 
 **Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Child snapshots still update the widget, but stalled/recovered supervision messages rarely need to wake the parent for user-driven sessions. Skipping the steer keeps the parent quiet until the child actually finishes.
 
@@ -367,7 +328,7 @@ Controls whether status transitions (`stalled`, `recovered`) wake the parent ses
 
 ```yaml
 ---
-name: planner
+name: worker
 # interactive defaults to true because auto-exit is not set
 ---
 ```
@@ -382,39 +343,31 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 
 ## Tool Access Control
 
-By default, every sub-agent can spawn further sub-agents. Control this with frontmatter:
+Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`. Only the tools named in the agent's `tools` frontmatter are exposed, and only the extensions that register those tools are loaded back in via explicit `--extension` flags. There is no global default toolset and no deny-list to maintain — an agent gets exactly what it asks for.
 
-### `spawning: false`
+### Granting the ability to spawn: `subagent_agents`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Spawning is **off by default**. An agent cannot spawn sub-agents unless its frontmatter declares a `subagent_agents` list. Presence of that field:
+
+1. Grants the full spawning toolset (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`) — you do **not** list these in `tools`.
+2. Loads this extension into the child process.
+3. Restricts the child to spawning **only** the named agents. The child's `subagents_list` is filtered to that set, and `subagent` calls for any other agent are rejected. Enforced via the `PI_SUBAGENT_ALLOWED` env var.
 
 ```yaml
 ---
 name: worker
-spawning: false
----
-```
-
-### `deny-tools`
-
-Fine-grained control over individual extension tools:
-
-```yaml
----
-name: focused-agent
-deny-tools: subagent
+tools: read, write, edit, safe_bash, web_search, web_fetch
+subagent_agents: scout, researcher
 ---
 ```
 
 ### Recommended Configuration
 
-| Agent      | `spawning`  | Rationale                                    |
-| ---------- | ----------- | -------------------------------------------- |
-| planner    | _(default)_ | Legitimately spawns scouts for investigation |
-| worker     | `false`     | Should implement tasks, not delegate         |
-| researcher | `false`     | Should research, not spawn                   |
-| reviewer   | `false`     | Should review, not spawn                     |
-| scout      | `false`     | Should gather context, not spawn             |
+| Agent      | `subagent_agents`   | Rationale                                              |
+| ---------- | ------------------- | ------------------------------------------------------ |
+| worker     | `scout, researcher` | Delegates recon/research to protect its own context    |
+| scout      | _(omitted)_         | Read-only recon; should gather context, not spawn      |
+| researcher | _(omitted)_         | Web research only; should research, not spawn          |
 
 ---
 
@@ -445,7 +398,7 @@ Set a default `cwd` in agent frontmatter:
 ---
 name: game-designer
 cwd: ./agents/game-designer
-spawning: false
+tools: read, write, edit, safe_bash
 ---
 ```
 
@@ -453,13 +406,12 @@ spawning: false
 
 ## Tools Widget
 
-Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
+Every sub-agent session displays a compact tools widget showing the agent's allowlisted tools. Toggle with `Ctrl+Alt+O`:
 
 ```
-[scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
-[scout] — 12 available  (Ctrl+J to collapse)          ← expanded
-  read, bash, edit, write, todo, ...
-  denied: subagent, subagents_list, ...
+[scout] — 4 tools  (Ctrl+Alt+O)                          ← collapsed
+[scout] — 4 available  (Ctrl+Alt+O to collapse)          ← expanded
+  read, grep, find, ls
 ```
 
 ---

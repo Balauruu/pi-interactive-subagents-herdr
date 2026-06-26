@@ -15,6 +15,7 @@ import {
   copySessionFile,
   mergeNewEntries,
   seedSubagentSessionFile,
+  summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
 import {
@@ -473,6 +474,75 @@ describe("session.ts", () => {
       // Target should now have 3 entries
       const targetLines = readFileSync(targetFile, "utf8").trim().split("\n");
       assert.equal(targetLines.length, 3);
+    });
+  });
+
+  describe("summarizeSessionStats", () => {
+    const asstWithUsage = (id: string, opts: {
+      model?: string;
+      tools?: string[];
+      usage?: Record<string, unknown>;
+    }) => ({
+      type: "message",
+      id,
+      parentId: "user-001",
+      message: {
+        role: "assistant",
+        ...(opts.model ? { model: opts.model } : {}),
+        content: [
+          { type: "text", text: "ok" },
+          ...(opts.tools ?? []).map((name, i) => ({ type: "toolCall", name, id: `${id}-tc${i}` })),
+        ],
+        ...(opts.usage ? { usage: opts.usage } : {}),
+      },
+    });
+
+    it("aggregates tokens/cost cumulatively and tracks last context size", () => {
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        { type: "model_change", id: "mc-001", parentId: null, modelId: "claude-sonnet-4-6" },
+        USER_MSG,
+        asstWithUsage("a1", {
+          tools: ["read", "grep"],
+          usage: { input: 100, output: 50, cacheRead: 1000, cacheWrite: 200, totalTokens: 1350, cost: { total: 0.01 } },
+        }),
+        asstWithUsage("a2", {
+          tools: ["write"],
+          usage: { input: 30, output: 70, cacheRead: 2000, cacheWrite: 0, totalTokens: 3500, cost: { total: 0.02 } },
+        }),
+      ]);
+      const stats = summarizeSessionStats(file)!;
+      assert.equal(stats.model, "claude-sonnet-4-6");
+      assert.equal(stats.toolCount, 3);
+      assert.equal(stats.inputTokens, 130);
+      assert.equal(stats.outputTokens, 120);
+      assert.equal(stats.cacheReadTokens, 3000);
+      assert.equal(stats.cacheWriteTokens, 200);
+      // contextTokens is the LAST assistant turn's totalTokens, not the sum.
+      assert.equal(stats.contextTokens, 3500);
+      assert.ok(Math.abs(stats.cost - 0.03) < 1e-9);
+    });
+
+    it("prefers per-message model over model_change", () => {
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        { type: "model_change", id: "mc-001", parentId: null, modelId: "claude-haiku-4-5" },
+        asstWithUsage("a1", { model: "claude-sonnet-4-6", usage: { totalTokens: 10, cost: { total: 0 } } }),
+      ]);
+      assert.equal(summarizeSessionStats(file)!.model, "claude-sonnet-4-6");
+    });
+
+    it("handles missing usage gracefully", () => {
+      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
+      const stats = summarizeSessionStats(file)!;
+      assert.equal(stats.toolCount, 0);
+      assert.equal(stats.inputTokens, 0);
+      assert.equal(stats.cost, 0);
+      assert.equal(stats.contextTokens, 0);
+    });
+
+    it("returns null for an unreadable file", () => {
+      assert.equal(summarizeSessionStats(join(dir, "does-not-exist.jsonl")), null);
     });
   });
 });
@@ -987,24 +1057,55 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
-    for (const name of ["scout", "worker", "reviewer"]) {
+  it("bundled scout/researcher resolve as non-interactive; worker resolves as interactive", () => {
+    for (const name of ["scout", "researcher"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(
         testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
         false,
-        `${name} should resolve as non-interactive (autonomous)`,
+        `${name} should resolve as non-interactive (autonomous, auto-exit)`,
       );
     }
 
-    const planner = testApi.loadAgentDefaults("planner");
-    assert.ok(planner, "expected bundled planner to be discoverable");
+    const worker = testApi.loadAgentDefaults("worker");
+    assert.ok(worker, "expected bundled worker to be discoverable");
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
+      testApi.resolveEffectiveInteractive({ name: "worker", task: "" }, worker),
       true,
-      "planner should resolve as interactive (no auto-exit)",
+      "worker should resolve as interactive (no auto-exit)",
     );
+  });
+
+  it("worker is granted the spawning toolset restricted to scout and researcher", () => {
+    const worker = testApi.loadAgentDefaults("worker");
+    assert.ok(worker, "expected bundled worker to be discoverable");
+    assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
+
+    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
+    assert.ok(allowlist, "expected an allowlist");
+    const tools = new Set(allowlist!.split(","));
+    for (const t of ["subagent", "subagent_interrupt", "subagents_list", "subagent_resume"]) {
+      assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
+    }
+    assert.ok(tools.has("safe_bash"), "expected worker to keep safe_bash");
+  });
+
+  it("scout and researcher are not granted spawning tools", () => {
+    for (const name of ["scout", "researcher"]) {
+      const defs = testApi.loadAgentDefaults(name);
+      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+      assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
+    }
+  });
+
+  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
+    assert.equal(testApi.getToolExtensionPath("read"), undefined);
+    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
+    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+    // Spawning tools are registered by this extension itself.
+    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1343,19 +1444,28 @@ describe("cmux.ts interpretExitSidecar", () => {
   });
 });
 describe("commands", () => {
-  it("/iterate always emits a full-context fork tool call", () => {
+  it("/subagent emits a spawn tool call for a known agent", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
 
     (subagentsModule as any).default(api);
 
-    const iterate = registeredCommands.find((command) => command.name === "iterate");
-    assert.ok(iterate, "expected /iterate to be registered");
+    const subagent = registeredCommands.find((command) => command.name === "subagent");
+    assert.ok(subagent, "expected /subagent to be registered");
 
-    iterate.handler("Fix the bug", {});
+    subagent.handler("scout map the auth code", {
+      ui: { notify() {} },
+    });
 
     assert.equal(sentUserMessages.length, 1);
-    assert.match(sentUserMessages[0], /fork: true/);
-    assert.match(sentUserMessages[0], /name: "Iterate"/);
+    assert.match(sentUserMessages[0], /agent: "scout"/);
+    assert.match(sentUserMessages[0], /map the auth code/);
+  });
+
+  it("does not register the removed /iterate or /plan commands", () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    assert.equal(registeredCommands.find((c) => c.name === "iterate"), undefined);
+    assert.equal(registeredCommands.find((c) => c.name === "plan"), undefined);
   });
 });
 
@@ -1373,14 +1483,6 @@ describe("tool registration", () => {
     });
   });
 
-  it("expands spawning false to deny subagent interruption", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const denied = testApi.resolveDenyTools({ spawning: false });
-
-    assert.equal(denied.has("subagent"), true);
-    assert.equal(denied.has("subagent_interrupt"), true);
-    assert.equal(denied.has("subagent_resume"), true);
-  });
 
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
@@ -2082,6 +2184,81 @@ describe("subagents widget rendering", () => {
         );
       }
     }
+  });
+});
+
+describe("subagent display helpers", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  describe("formatTokens", () => {
+    it("renders raw counts below 1k, 1 decimal below 10k, rounded k above", () => {
+      assert.equal(testApi.formatTokens(850), "850");
+      assert.equal(testApi.formatTokens(3200), "3.2k");
+      assert.equal(testApi.formatTokens(45000), "45k");
+    });
+  });
+
+  describe("contextWindowFor", () => {
+    it("maps known model families and returns undefined otherwise", () => {
+      assert.equal(testApi.contextWindowFor("claude-sonnet-4-6"), 200_000);
+      assert.equal(testApi.contextWindowFor("gemini-2.5-pro"), 1_000_000);
+      assert.equal(testApi.contextWindowFor("some-unknown-model"), undefined);
+      assert.equal(testApi.contextWindowFor(null), undefined);
+    });
+  });
+
+  describe("formatContextUsage", () => {
+    it("shows a percent gauge when the window is known", () => {
+      assert.equal(testApi.formatContextUsage(36_000, 200_000), "18.0%/200k");
+      assert.equal(testApi.formatContextUsage(500_000, 1_000_000), "50.0%/1.0M");
+    });
+
+    it("falls back to a window-less ctx label when unknown", () => {
+      assert.equal(testApi.formatContextUsage(37_000, undefined), "37k ctx");
+    });
+  });
+
+  describe("formatUsageSegments", () => {
+    it("emits arrow/cache/cost segments, skipping zero fields", () => {
+      const segs = testApi.formatUsageSegments({
+        model: "claude-sonnet-4-6",
+        toolCount: 3,
+        inputTokens: 3200,
+        outputTokens: 890,
+        cacheReadTokens: 45000,
+        cacheWriteTokens: 0,
+        contextTokens: 7000,
+        cost: 0.042,
+      });
+      assert.deepEqual(segs, ["↑3.2k", "↓890", "R45k", "$0.042"]);
+    });
+
+    it("returns an empty list when there is no usage", () => {
+      assert.deepEqual(
+        testApi.formatUsageSegments({
+          model: null,
+          toolCount: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          contextTokens: 0,
+          cost: 0,
+        }),
+        [],
+      );
+    });
+  });
+
+  describe("widgetIcon", () => {
+    it("maps active/running to a glyph and waiting/starting to another", () => {
+      const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+      assert.equal(strip(testApi.widgetIcon("active")), "⟳");
+      assert.equal(strip(testApi.widgetIcon("running")), "⟳");
+      assert.equal(strip(testApi.widgetIcon("stalled")), "⟳");
+      assert.equal(strip(testApi.widgetIcon("waiting")), "○");
+      assert.equal(strip(testApi.widgetIcon("starting")), "○");
+    });
   });
 });
 

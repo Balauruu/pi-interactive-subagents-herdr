@@ -24,8 +24,6 @@ import {
   getMuxBackend,
   sendEscape,
   shellEscape,
-  renameCurrentTab,
-  renameWorkspace,
   readScreen,
 } from "./cmux.ts";
 
@@ -33,6 +31,8 @@ import {
   findLastAssistantMessage,
   getNewEntries,
   seedSubagentSessionFile,
+  summarizeSessionStats,
+  type SessionStats,
 } from "./session.ts";
 import {
   type StatusSnapshot,
@@ -136,8 +136,13 @@ interface AgentDefaults {
   tools?: string;
   skills?: string;
   thinking?: string;
-  denyTools?: string;
-  spawning?: boolean;
+  /**
+   * If set (non-empty), this agent is granted the full subagent spawning
+   * toolset and may only spawn the listed agents. Presence of this field —
+   * not the `tools` list — is what grants spawning. Enforced in the child via
+   * the PI_SUBAGENT_ALLOWED env var.
+   */
+  subagentAgents?: string[];
   autoExit?: boolean;
   interactive?: boolean;
   systemPromptMode?: "append" | "replace";
@@ -160,45 +165,61 @@ interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
 }
 
-/** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set([
+/**
+ * The full subagent lifecycle/spawning toolset registered by this extension.
+ * An agent is granted these (and this extension is loaded into its child
+ * process) only when its frontmatter declares a non-empty `subagent_agents`.
+ */
+const SPAWNING_TOOLS = [
   "subagent",
   "subagent_interrupt",
   "subagents_list",
   "subagent_resume",
-]);
+] as const;
 
-/**
- * Resolve the effective set of denied tool names from agent defaults.
- * `spawning: false` expands to all SPAWNING_TOOLS.
- * `deny-tools` adds individual tool names on top.
- */
-function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
-  const denied = new Set<string>();
-  if (!agentDefs) return denied;
-
-  // spawning: false → deny all spawning tools
-  if (agentDefs.spawning === false) {
-    for (const t of SPAWNING_TOOLS) denied.add(t);
-  }
-
-  // deny-tools: explicit list
-  if (agentDefs.denyTools) {
-    for (const t of agentDefs.denyTools
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)) {
-      denied.add(t);
-    }
-  }
-
-  return denied;
-}
+/** Built-in tools pi provides natively — no extension needs to be loaded. */
+const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
+
+/**
+ * Map a custom (non-built-in) tool name to the pi-extension file that
+ * registers it. Used to build the child's `--extension` whitelist after
+ * `--no-extensions` disables global discovery. Returns undefined for built-in
+ * tools and for unknown names (which simply won't be granted).
+ */
+function getToolExtensionPath(tool: string): string | undefined {
+  if (BUILTIN_TOOLS.has(tool)) return undefined;
+  // The four spawning tools are registered by THIS extension.
+  if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
+    return fileURLToPath(import.meta.url);
+  }
+  const extBase = join(getAgentConfigDir(), "extensions");
+  const map: Record<string, string> = {
+    web_search: join(extBase, "web-search", "index.ts"),
+    web_fetch: join(extBase, "web-fetch", "index.ts"),
+    video_extract: join(extBase, "video-extract", "index.ts"),
+    youtube_search: join(extBase, "youtube-search", "index.ts"),
+    google_image_search: join(extBase, "google-image-search", "index.ts"),
+    safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
+  };
+  return map[tool];
+}
+
+/**
+ * When this process was spawned as a restricted subagent, the parent pins the
+ * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
+ * restriction (top-level session, or an unrestricted child).
+ */
+const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
+  const raw = process.env.PI_SUBAGENT_ALLOWED;
+  if (!raw) return null;
+  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  return list.length > 0 ? new Set(list) : null;
+})();
 
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
@@ -211,6 +232,13 @@ function getFrontmatterValue(frontmatter: string, key: string): string | undefin
 
 function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return value != null ? value === "true" : undefined;
+}
+
+/** Parse a comma-separated frontmatter value into a trimmed list (or undefined). */
+function parseCommaList(value: string | undefined): string[] | undefined {
+  if (value == null) return undefined;
+  const list = value.split(",").map((s) => s.trim()).filter(Boolean);
+  return list.length > 0 ? list : undefined;
 }
 
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
@@ -241,8 +269,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
           : undefined,
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     thinking: getFrontmatterValue(frontmatter, "thinking"),
-    denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
-    spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
+    subagentAgents: parseCommaList(getFrontmatterValue(frontmatter, "subagent_agents")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
@@ -274,7 +301,10 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
     }
   }
 
-  return [...agents.values()];
+  // When this process is itself a restricted subagent, only expose the agents
+  // it is permitted to spawn (PI_SUBAGENT_ALLOWED). Top-level sessions see all.
+  const all = [...agents.values()];
+  return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
 }
 
 function resolveSubagentPaths(
@@ -380,6 +410,71 @@ function formatElapsed(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
+/** Compact token count: 850, 3.2k, 45k. */
+function formatTokens(n: number): string {
+  return n < 1000 ? String(n) : n < 10000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n / 1000)}k`;
+}
+
+/**
+ * Known context-window sizes by model id substring, used for the context-usage
+ * gauge. Unknown models fall back to a window-less "Nk ctx" label.
+ */
+function contextWindowFor(model: string | null | undefined): number | undefined {
+  if (!model) return undefined;
+  const m = model.toLowerCase();
+  if (m.includes("claude")) return 200_000;
+  if (m.includes("gpt-4.1") || m.includes("gpt-4o")) return 128_000;
+  if (m.includes("gemini")) return 1_000_000;
+  return undefined;
+}
+
+/** Context-usage gauge: "18.0%/200k" when window known, else "37k ctx". */
+function formatContextUsage(tokens: number, contextWindow: number | undefined): string {
+  if (!contextWindow) return `${formatTokens(tokens)} ctx`;
+  const pct = (tokens / contextWindow) * 100;
+  const maxStr =
+    contextWindow >= 1_000_000
+      ? `${(contextWindow / 1_000_000).toFixed(1)}M`
+      : `${Math.round(contextWindow / 1000)}k`;
+  return `${pct.toFixed(1)}%/${maxStr}`;
+}
+
+/**
+ * Build the dim usage line for a completed subagent, mirroring the format of
+ * the in-process subagents extension: "↑in ↓out R… W… $cost · ctx".
+ * `theme.fg` is applied by the caller; this returns plain segments joined.
+ */
+function formatUsageSegments(stats: SessionStats): string[] {
+  const segs: string[] = [];
+  if (stats.inputTokens) segs.push(`↑${formatTokens(stats.inputTokens)}`);
+  if (stats.outputTokens) segs.push(`↓${formatTokens(stats.outputTokens)}`);
+  if (stats.cacheReadTokens) segs.push(`R${formatTokens(stats.cacheReadTokens)}`);
+  if (stats.cacheWriteTokens) segs.push(`W${formatTokens(stats.cacheWriteTokens)}`);
+  if (stats.cost) segs.push(`$${stats.cost.toFixed(3)}`);
+  return segs;
+}
+
+/** ANSI colors for widget status icons (raw, since the widget bypasses theme). */
+const ICON_GREEN = "\x1b[38;2;126;186;103m";
+const ICON_YELLOW = "\x1b[38;2;214;181;94m";
+const ICON_RED = "\x1b[38;2;224;108;117m";
+const ICON_DIM = "\x1b[38;2;128;128;128m";
+
+/** Map a live status kind to a colored single-char icon for the widget. */
+function widgetIcon(kind: StatusSnapshot["kind"]): string {
+  switch (kind) {
+    case "active":
+    case "running":
+      return `${ICON_YELLOW}⟳${RST}`;
+    case "stalled":
+      return `${ICON_RED}⟳${RST}`;
+    case "waiting":
+    case "starting":
+    default:
+      return `${ICON_DIM}○${RST}`;
+  }
+}
+
 /**
  * Wait long enough for a freshly created pane to finish shell startup.
  *
@@ -481,6 +576,8 @@ interface SubagentResult {
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   ping?: { name: string; message: string };
+  /** Aggregate usage/model/tool stats parsed from the completed session file. */
+  stats?: SessionStats;
 }
 
 /**
@@ -606,8 +703,9 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   for (const agent of agents) {
     const elapsed = formatElapsedMMSS(agent.startTime);
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
-    const left = ` ${elapsed}  ${agent.name}${agentTag} `;
     const snapshot = classifyStatus(agent.statusState, Date.now());
+    const icon = widgetIcon(snapshot.kind);
+    const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
       : agent.cli === "claude"
@@ -670,15 +768,25 @@ const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
  * control tools from subagent-done.ts would otherwise be hidden, leaving a
  * manually resumed or user-touched subagent unable to call subagent_done.
  */
-function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
+function buildSubagentToolAllowlist(
+  effectiveTools?: string,
+  opts?: { grantSpawning?: boolean },
+): string | null {
   const requested = (effectiveTools ?? "")
     .split(",")
     .map((tool) => tool.trim())
     .filter(Boolean);
 
-  if (requested.length === 0) return null;
+  const grantSpawning = opts?.grantSpawning ?? false;
+
+  // No explicit tool restriction and no spawning grant → don't pass --tools at
+  // all (the child keeps its default toolset).
+  if (requested.length === 0 && !grantSpawning) return null;
 
   const allow = new Set(requested);
+  if (grantSpawning) {
+    for (const tool of SPAWNING_TOOLS) allow.add(tool);
+  }
   for (const tool of SUBAGENT_CONTROL_TOOLS) {
     allow.add(tool);
   }
@@ -905,7 +1013,7 @@ export const __test__ = {
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
-  resolveDenyTools,
+  getToolExtensionPath,
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
@@ -913,6 +1021,11 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
+  formatTokens,
+  formatContextUsage,
+  contextWindowFor,
+  formatUsageSegments,
+  widgetIcon,
 };
 
 function startWidgetRefresh() {
@@ -998,7 +1111,9 @@ async function launchSubagent(
   const summaryInstruction = agentDefs?.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
+  // An agent with a non-empty subagent_agents list is granted the spawning
+  // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
+  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -1111,12 +1226,28 @@ async function launchSubagent(
     parts.push(flag, shellEscape(syspromptPath));
   }
 
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
+  // Default-deny model: when an agent restricts its tools (or is granted the
+  // spawning toolset), we disable global extension discovery and re-enable only
+  // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
+  // restriction keep their full default toolset and all global extensions.
+  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
   if (toolAllowlist) {
+    parts.push("--no-extensions");
     parts.push("--tools", shellEscape(toolAllowlist));
+
+    const extPaths = new Set<string>();
+    for (const tool of toolAllowlist.split(",")) {
+      const extPath = getToolExtensionPath(tool);
+      // Skip extensions that can't be resolved on disk so a missing optional
+      // extension never breaks the launch (the tool simply won't be available).
+      if (extPath && existsSync(extPath)) extPaths.add(extPath);
+    }
+    for (const extPath of extPaths) {
+      parts.push("-e", shellEscape(extPath));
+    }
   }
 
-  // Build env prefix: denied tools + subagent identity + config dir propagation
+  // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = [];
 
   // If the target cwd has its own .pi/agent/, use that as the config root.
@@ -1127,8 +1258,8 @@ async function launchSubagent(
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
   }
 
-  if (denySet.size > 0) {
-    envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
+  if (grantSpawning && agentDefs?.subagentAgents) {
+    envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
   if (params.agent) {
@@ -1316,6 +1447,8 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
+    const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
+
     closeSurface(surface);
     runningSubagents.delete(running.id);
 
@@ -1328,6 +1461,7 @@ async function watchSubagent(
       elapsed,
       ping: result.ping,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
     try {
@@ -1383,19 +1517,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     runningSubagents.clear();
   });
 
-  // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
-  const deniedTools = new Set(
-    (process.env.PI_DENY_TOOLS ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
-
-  const shouldRegister = (name: string) => !deniedTools.has(name);
+  // The spawning tools are always registered here. Whether a child process can
+  // actually see/use them is governed by the parent's `--tools` allowlist and
+  // by which extensions are loaded into the child (default-deny --no-extensions
+  // + explicit -e). See launchSubagent().
 
   // ── subagent tool ──
-  if (shouldRegister("subagent"))
-    pi.registerTool({
+  pi.registerTool({
       name: "subagent",
       label: "Subagent",
       description:
@@ -1426,6 +1554,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
             ],
             details: { error: "self-spawn blocked" },
+          };
+        }
+
+        // Enforce the spawn allowlist when this process is itself a restricted
+        // subagent (e.g. a worker may only spawn scout/researcher).
+        if (params.agent && SUBAGENT_ALLOWLIST && !SUBAGENT_ALLOWLIST.has(params.agent)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `You may not spawn the "${params.agent}" agent. ` +
+                  `You are only permitted to spawn: ${[...SUBAGENT_ALLOWLIST].join(", ")}.`,
+              },
+            ],
+            details: { error: "agent not in allowlist" },
           };
         }
 
@@ -1499,6 +1643,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: result.sessionFile,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+                  ...(result.stats ? { stats: result.stats } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -1552,7 +1697,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ? theme.fg("dim", ` in ${partialArgs.cwd}`)
           : "";
         let text =
-          "▸ " +
+          "○ " +
           theme.fg("toolTitle", theme.bold(name)) +
           agent +
           cwdHint;
@@ -1582,7 +1727,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // "Started" result — tool returned immediately
         if (details?.status === "started") {
           return new Text(
-            theme.fg("accent", "▸") +
+            theme.fg("accent", "⟳") +
               " " +
               theme.fg("toolTitle", theme.bold(name)) +
               theme.fg("dim", " — started"),
@@ -1598,8 +1743,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
   // ── subagent_interrupt tool ──
-  if (shouldRegister("subagent_interrupt"))
-    pi.registerTool({
+  pi.registerTool({
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
       description:
@@ -1622,7 +1766,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       renderCall(args, theme) {
         const target = args.id ? `${args.id}` : args.name ?? "(unknown)";
         return new Text(
-          theme.fg("accent", "▸") +
+          theme.fg("accent", "○") +
             " " +
             theme.fg("toolTitle", theme.bold(target)) +
             theme.fg("dim", " — interrupt turn"),
@@ -1635,7 +1779,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const details = result.details as any;
         if (details?.status === "interrupt_requested") {
           return new Text(
-            theme.fg("accent", "▸") +
+            theme.fg("accent", "✗") +
               " " +
               theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
               theme.fg("dim", " — interrupt requested"),
@@ -1650,8 +1794,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
   // ── subagents_list tool ──
-  if (shouldRegister("subagents_list"))
-    pi.registerTool({
+  pi.registerTool({
       name: "subagents_list",
       label: "List Subagents",
       description:
@@ -1706,8 +1849,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
   // ── subagent_resume tool ──
-  if (shouldRegister("subagent_resume"))
-    pi.registerTool({
+  pi.registerTool({
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
@@ -1745,7 +1887,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       renderCall(args, theme) {
         const name = args.name ?? "Resume";
         const text =
-          "▸ " +
+          "○ " +
           theme.fg("toolTitle", theme.bold(name)) +
           theme.fg("dim", " — resuming session");
         return new Text(text, 0, 0);
@@ -1757,7 +1899,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         if (details?.status === "started") {
           return new Text(
-            theme.fg("accent", "▸") +
+            theme.fg("accent", "⟳") +
               " " +
               theme.fg("toolTitle", theme.bold(name)) +
               theme.fg("dim", " — resumed"),
@@ -1963,18 +2105,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // /iterate command — fork the session into a subagent
-  pi.registerCommand("iterate", {
-    description: "Fork session into a subagent for focused work (bugfixes, iteration)",
-    handler: async (args, _ctx) => {
-      const task = args.trim() || "";
-      const toolCall = task
-        ? `Use subagent to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
-        : `Use subagent to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
-      pi.sendUserMessage(toolCall);
-    },
-  });
-
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
@@ -2020,17 +2150,40 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const bgFn = failed
           ? (text: string) => theme.bg("toolErrorBg", text)
           : (text: string) => theme.bg("toolSuccessBg", text);
+        const stats = (details.stats ?? null) as SessionStats | null;
         const icon = failed
           ? theme.fg("error", "✗")
           : theme.fg("success", "✓");
-        const status = errorMessage
-          ? "failed (provider/agent error)"
-          : failed
-            ? `failed (exit ${exitCode})`
-            : "completed";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
+        const modelTag = stats?.model ? theme.fg("dim", ` (${stats.model})`) : "";
+        const titleSegment = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag}${modelTag} ${theme.fg("dim", "—")} `;
 
-        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;
+        // Success: icon already conveys "completed", so show "N tools · duration"
+        // like the in-process extension. Failure: surface the failure reason.
+        let header: string;
+        if (failed) {
+          const reason = errorMessage ? "failed (provider/agent error)" : `failed (exit ${exitCode})`;
+          header = `${titleSegment}${theme.fg("error", reason)} ${theme.fg("dim", `· ${elapsed}`)}`;
+        } else {
+          const toolPart = stats ? `${stats.toolCount} tools · ${elapsed}` : elapsed;
+          header = `${titleSegment}${theme.fg("dim", toolPart)}`;
+        }
+
+        // Usage line: ↑in ↓out R… W… $cost · context-gauge (color-coded by %).
+        let usageLine: string | null = null;
+        if (stats) {
+          const segs = formatUsageSegments(stats).map((s) => theme.fg("dim", s));
+          if (stats.contextTokens > 0) {
+            const window = contextWindowFor(stats.model);
+            const ctxStr = formatContextUsage(stats.contextTokens, window);
+            const pct = window ? (stats.contextTokens / window) * 100 : 0;
+            const coloredCtx =
+              pct > 90 ? theme.fg("error", ctxStr) : pct > 70 ? theme.fg("warning", ctxStr) : theme.fg("dim", ctxStr);
+            segs.push(coloredCtx);
+          }
+          if (segs.length > 0) usageLine = segs.join(theme.fg("dim", " "));
+        }
+
         const rawContent = typeof message.content === "string" ? message.content : "";
 
         // Clean summary (remove session ref and leading label for display)
@@ -2047,6 +2200,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build content for the box
         const contentLines = [header];
+        if (usageLine) contentLines.push(usageLine);
 
         if (options.expanded) {
           // Full view: complete summary + session info
@@ -2148,35 +2302,5 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     };
   });
 
-  // /plan command — start the full planning workflow
-  pi.registerCommand("plan", {
-    description: "Start a planning session: /plan <what to build>",
-    handler: async (args, ctx) => {
-      const task = args.trim();
-      if (!task) {
-        ctx.ui.notify("Usage: /plan <what to build>", "warning");
-        return;
-      }
-
-      // Rename workspace and tab to show this is a planning session
-      if (isMuxAvailable()) {
-        try {
-          const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
-          renameWorkspace(`🎯 ${label}`);
-          renameCurrentTab(`🎯 Plan: ${label}`);
-        } catch {
-          // non-critical -- do not block the plan
-        }
-      }
-
-      // Load the plan skill from the subagents extension directory
-      const planSkillPath = join(SUBAGENTS_DIR, "plan-skill.md");
-      let content = readFileSync(planSkillPath, "utf8");
-      content = content.replace(/^---\n[\s\S]*?\n---\n*/, "");
-      pi.sendUserMessage(
-        `<skill name="plan" location="${planSkillPath}">\n${content.trim()}\n</skill>\n\n${task}`,
-      );
-    },
-  });
 }
 // test
