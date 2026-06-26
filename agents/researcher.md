@@ -2,7 +2,7 @@
 name: researcher
 description: Web researcher — searches the web and synthesizes findings
 tools: web_search, web_fetch
-model: anthropic/claude-sonnet-4-6
+model: openrouter/z-ai/glm-5.2
 thinking: medium
 system-prompt: append
 auto-exit: true

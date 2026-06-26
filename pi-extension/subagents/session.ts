@@ -1,9 +1,12 @@
 import {
   appendFileSync,
+  closeSync,
   copyFileSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   statSync,
   writeFileSync,
@@ -99,30 +102,44 @@ export function getLeafId(sessionFile: string): string | null {
  * then prefix), NOT the filename — so this is the value to hand back to the
  * orchestrator for follow-ups.
  */
-export function getSessionId(sessionFile: string): string | null {
+/**
+ * Read only the first line of a file without loading the whole thing into
+ * memory. Session files grow to many MB, but the header we need is always the
+ * first JSON line, so reading a small prefix keeps header lookups cheap — this
+ * is what makes scanning a large session tree fast enough to avoid blocking the
+ * event loop. Returns the first line (sans trailing newline), or null.
+ */
+function readFirstLine(path: string, maxBytes = 65536): string | null {
+  let fd: number | undefined;
   try {
-    const raw = readFileSync(sessionFile, "utf8");
-    for (const line of raw.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const entry = JSON.parse(trimmed) as { type?: string; id?: string };
-      if (entry.type === "session" && typeof entry.id === "string") {
-        return entry.id;
-      }
-      // Header is always the first entry; bail after the first parse.
-      break;
-    }
+    fd = openSync(path, "r");
+    const buf = Buffer.allocUnsafe(maxBytes);
+    const bytes = readSync(fd, buf, 0, maxBytes, 0);
+    if (bytes <= 0) return null;
+    const nl = buf.indexOf(0x0a); // '\n'
+    const end = nl === -1 || nl >= bytes ? bytes : nl;
+    return buf.toString("utf8", 0, end);
   } catch {
-    // fall through
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
   }
-  return null;
+}
+
+export function getSessionId(sessionFile: string): string | null {
+  return readHeaderId(sessionFile);
 }
 
 function readHeaderId(sessionFile: string): string | null {
+  const firstLine = readFirstLine(sessionFile)?.trim();
+  if (!firstLine) return null;
   try {
-    const raw = readFileSync(sessionFile, "utf8");
-    const firstLine = raw.split("\n", 1)[0]?.trim();
-    if (!firstLine) return null;
     const entry = JSON.parse(firstLine) as { type?: string; id?: string };
     return entry.type === "session" && typeof entry.id === "string" ? entry.id : null;
   } catch {
