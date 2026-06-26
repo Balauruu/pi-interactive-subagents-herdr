@@ -1076,23 +1076,6 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("resolveEffectiveInteractive honors the explicit tool parameter over all else", () => {
-    assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T", interactive: false },
-        { autoExit: false, interactive: true },
-      ),
-      false,
-    );
-    assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T", interactive: true },
-        { autoExit: true, interactive: false },
-      ),
-      true,
-    );
-  });
-
   it("bundled scout/researcher resolve as non-interactive; worker resolves as interactive", () => {
     for (const name of ["scout", "researcher"]) {
       const defs = testApi.loadAgentDefaults(name);
@@ -1162,17 +1145,14 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("resolves session mode with fork override precedence", () => {
+  it("resolves session mode from frontmatter (standalone default)", () => {
     assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
     assert.equal(
       testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
       "lineage-only",
     );
     assert.equal(
-      testApi.resolveEffectiveSessionMode(
-        { name: "A", task: "T", fork: true },
-        { sessionMode: "lineage-only" },
-      ),
+      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "fork" }),
       "fork",
     );
   });
@@ -1195,18 +1175,6 @@ describe("subagent discovery", () => {
     );
     assert.deepEqual(
       testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "fork" }),
-      {
-        sessionMode: "fork",
-        seededSessionMode: "fork",
-        inheritsConversationContext: true,
-        taskDelivery: "direct",
-      },
-    );
-    assert.deepEqual(
-      testApi.resolveLaunchBehavior(
-        { name: "A", task: "T", fork: true },
-        { sessionMode: "lineage-only" },
-      ),
       {
         sessionMode: "fork",
         seededSessionMode: "fork",
@@ -1546,7 +1514,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("documents that `agent` (not `name`) selects the agent profile", () => {
+  it("exposes a debloated schema: agent+task required, name/model/cwd optional, no override knobs", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1554,10 +1522,22 @@ describe("tool registration", () => {
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const props = subagentTool.parameters.properties;
-    // `name` must clarify it is cosmetic and does NOT select a profile.
-    assert.match(props.name.description, /does NOT select/i);
-    // `agent` must steer the model to set it for a specific profile.
-    assert.match(props.agent.description, /which agent profile to spawn/i);
+    assert.deepEqual(
+      Object.keys(props).sort(),
+      ["agent", "cwd", "model", "name", "task"],
+      "only agent/task/name/model/cwd should remain",
+    );
+    assert.deepEqual(
+      [...(subagentTool.parameters.required ?? [])].sort(),
+      ["agent", "task"],
+      "agent and task must be required",
+    );
+    // `name` is now optional and purely cosmetic.
+    assert.match(props.name.description, /cosmetic/i);
+    // The removed override knobs must be gone.
+    for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
+      assert.equal(props[gone], undefined, `expected ${gone} param to be removed`);
+    }
   });
 
   it("renders partial subagent tool-call args without throwing", () => {
@@ -1824,6 +1804,49 @@ describe("subagent interruption", () => {
       assert.match(missing.error, /No running subagent named "Ghost"/);
     } finally {
       runningMap.clear();
+    }
+  });
+
+  it("uniqueRunningName suffixes defaulted names that collide with running subagents", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      // No collision: base name is returned untouched.
+      assert.equal(testApi.uniqueRunningName("worker"), "worker");
+
+      runningMap.set("a1", makeRunning({ id: "a1", name: "worker", surface: "a1" }));
+      assert.equal(testApi.uniqueRunningName("worker"), "worker-2");
+
+      runningMap.set("b2", makeRunning({ id: "b2", name: "worker-2", surface: "b2" }));
+      assert.equal(testApi.uniqueRunningName("worker"), "worker-3");
+
+      // A distinct base is unaffected by the worker collisions.
+      assert.equal(testApi.uniqueRunningName("scout"), "scout");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("uniqueRunningName also avoids names reserved by in-flight parallel spawns", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const reserved = testApi.reservedNames as Set<string>;
+    runningMap.clear();
+    reserved.clear();
+
+    try {
+      // Simulate the first parallel spawn reserving its default name before it
+      // has registered in runningSubagents.
+      reserved.add(testApi.uniqueRunningName("scout")); // "scout"
+      // The second spawn, running concurrently, must not reuse it.
+      assert.equal(testApi.uniqueRunningName("scout"), "scout-2");
+      reserved.add("scout-2");
+      assert.equal(testApi.uniqueRunningName("scout"), "scout-3");
+    } finally {
+      runningMap.clear();
+      reserved.clear();
     }
   });
 

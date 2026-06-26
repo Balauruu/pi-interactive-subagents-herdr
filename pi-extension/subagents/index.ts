@@ -87,53 +87,24 @@ function getModuleAbortSignal(): AbortSignal {
 }
 
 const SubagentParams = Type.Object({
-  name: Type.String({
+  agent: Type.String({
     description:
-      "Display label for this subagent's pane only — it does NOT select an agent profile. " +
-      "To run a specific agent (scout, researcher, etc.) you MUST set the `agent` field; `name` is purely cosmetic.",
+      "Which agent to spawn (e.g. 'worker', 'scout', 'researcher'). This loads the agent's " +
+      "fixed profile — its model, tool loadout, and system prompt. Must be one of the available agents.",
   }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
-  agent: Type.Optional(
+  name: Type.Optional(
     Type.String({
       description:
-        "Which agent profile to spawn (e.g. 'worker', 'scout', 'researcher'). " +
-        "This is what loads the agent's model, tools, and system prompt from <name>.md. " +
-        "Set this whenever you want a specific agent — do NOT put the agent name in `name` and leave this empty, " +
-        "or the child launches with NO restrictions (full default toolset) instead of the agent's profile.",
+        "Optional cosmetic label for the subagent's pane and widget row. Defaults to the agent name. " +
+        "Has no effect on which agent runs — use `agent` for that.",
     }),
   ),
-  systemPrompt: Type.Optional(
-    Type.String({ description: "Appended to system prompt (role instructions)" }),
-  ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
-  skills: Type.Optional(
-    Type.String({ description: "Comma-separated skills (overrides agent default)" }),
-  ),
-  tools: Type.Optional(
-    Type.String({ description: "Comma-separated tools (overrides agent default)" }),
-  ),
   cwd: Type.Optional(
     Type.String({
       description:
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
-    }),
-  ),
-  fork: Type.Optional(
-    Type.Boolean({
-      description:
-        "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
-    }),
-  ),
-  interactive: Type.Optional(
-    Type.Boolean({
-      description:
-        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
-    }),
-  ),
-  resumeSessionId: Type.Optional(
-    Type.String({
-      description:
-        "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use this to retry cancelled runs or ask follow-up questions.",
     }),
   ),
 });
@@ -346,7 +317,6 @@ function resolveEffectiveSessionMode(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): SubagentSessionMode {
-  if (params.fork) return "fork";
   return agentDefs?.sessionMode ?? "standalone";
 }
 
@@ -373,23 +343,16 @@ function resolveLaunchBehavior(
  * Decide whether a subagent is interactive (user-driven, long-running).
  *
  * Resolution order:
- *   1. Explicit `interactive` tool parameter wins.
- *   2. Explicit `interactive` frontmatter field on the agent.
- *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
- *      autonomous (scout, worker, reviewer) and the parent session should be
+ *   1. Explicit `interactive` frontmatter field on the agent.
+ *   2. Default: the inverse of `auto-exit`. Agents that auto-exit are
+ *      autonomous (scout, researcher) and the parent session should be
  *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (planner, iterate/fork) and
- *      stall pings are noise.
- *
- * When no agent defs exist at all (bare `subagent({ name, task })` call,
- * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
- * subagent is treated as interactive — matching the intent of iterate.
+ *      driven by the user in their own pane (worker) and stall pings are noise.
  */
 function resolveEffectiveInteractive(
-  params: Static<typeof SubagentParams>,
+  _params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): boolean {
-  if (params.interactive != null) return params.interactive;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !(agentDefs?.autoExit ?? false);
 }
@@ -867,6 +830,30 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
   }, observedAt);
 }
 
+/**
+ * Names claimed by spawns that are mid-launch but not yet registered in
+ * `runningSubagents`. Parallel `subagent` tool calls run their synchronous
+ * prefix (name defaulting) before any of them finishes `launchSubagent` and
+ * registers, so without this they'd all see an empty map and pick the same
+ * name. Reserved synchronously when a default name is chosen and released once
+ * the subagent registers (or its launch fails).
+ */
+const reservedNames = new Set<string>();
+
+/**
+ * Return `base`, or `base-2`, `base-3`, … if a running subagent already uses
+ * that name (or a parallel spawn has reserved it). Keeps defaulted pane labels
+ * unique so `subagent_message({ name })` can address each one unambiguously.
+ */
+function uniqueRunningName(base: string): string {
+  const taken = new Set(Array.from(runningSubagents.values()).map((r) => r.name));
+  for (const reserved of reservedNames) taken.add(reserved);
+  if (!taken.has(base)) return base;
+  let n = 2;
+  while (taken.has(`${base}-${n}`)) n++;
+  return `${base}-${n}`;
+}
+
 function resolveRunningByName(name: string):
   | { running: RunningSubagent }
   | { error: string } {
@@ -1030,6 +1017,8 @@ export const __test__ = {
   observeRunningSubagent,
   getToolExtensionPath,
   resolveRunningByName,
+  uniqueRunningName,
+  reservedNames,
   steerSubagent,
   handleSubagentSteer,
   resolveResultPresentation,
@@ -1068,8 +1057,8 @@ async function launchSubagent(
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
-  const effectiveTools = params.tools ?? agentDefs?.tools;
-  const effectiveSkills = params.skills ?? agentDefs?.skills;
+  const effectiveTools = agentDefs?.tools;
+  const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
@@ -1129,7 +1118,7 @@ async function launchSubagent(
   // An agent with a non-empty subagent_agents list is granted the spawning
   // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
   const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
-  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
+  const identity = agentDefs?.body ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
@@ -1154,13 +1143,9 @@ async function launchSubagent(
       cmdParts.push("--model", shellEscape(effectiveModel));
     }
 
-    const sp = params.systemPrompt ?? agentDefs.body;
+    const sp = agentDefs.body;
     if (sp) {
       cmdParts.push("--append-system-prompt", shellEscape(sp));
-    }
-
-    if (params.resumeSessionId) {
-      cmdParts.push("--resume", shellEscape(params.resumeSessionId));
     }
 
     // Always pass the task as the prompt — even for resumed sessions,
@@ -1589,21 +1574,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const permittedList = permittedAgents.join(", ") || "(none)";
 
         if (!params.agent) {
-          const forkAllowed = !SUBAGENT_ALLOWLIST && params.fork === true;
-          if (!forkAllowed) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `You must specify which agent to spawn via the "agent" field. ` +
-                    `Available agents: ${permittedList}. ` +
-                    `(The "name" field is just a display label — set "agent" to one of the available agents.)`,
-                },
-              ],
-              details: { error: "agent required" },
-            };
-          }
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `You must specify which agent to spawn via the "agent" field. ` +
+                  `Available agents: ${permittedList}.`,
+              },
+            ],
+            details: { error: "agent required" },
+          };
         } else if (!permittedSet.has(params.agent)) {
           return {
             content: [
@@ -1619,6 +1600,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               error: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
             },
           };
+        }
+
+        // Default the cosmetic pane label to the agent name when omitted,
+        // disambiguating against any running subagent already using it so
+        // subagent_message({ name }) can target each one unambiguously. Reserve
+        // the chosen name synchronously (before any await) so parallel spawns
+        // don't all pick the same default.
+        let reservedName: string | null = null;
+        if (!params.name?.trim()) {
+          params.name = uniqueRunningName(params.agent);
+          reservedName = params.name;
+          reservedNames.add(reservedName);
         }
 
         // Validate prerequisites
@@ -1638,8 +1631,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        // Launch the subagent (creates pane, sends command). Release the name
+        // reservation once it registers in runningSubagents (or launch fails) —
+        // from then on uniqueRunningName tracks it via the running map.
+        let running;
+        try {
+          running = await launchSubagent(params, ctx);
+        } finally {
+          if (reservedName) reservedNames.delete(reservedName);
+        }
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1741,11 +1741,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderCall(args, theme) {
         const partialArgs = args as Record<string, unknown>;
-        const name = typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : "(unnamed)";
+        const agentName =
+          typeof partialArgs.agent === "string" && partialArgs.agent ? partialArgs.agent : "";
+        const name =
+          typeof partialArgs.name === "string" && partialArgs.name
+            ? partialArgs.name
+            : agentName || "(unnamed)";
         const task = typeof partialArgs.task === "string" ? partialArgs.task : "";
-        const agent = typeof partialArgs.agent === "string" && partialArgs.agent
-          ? theme.fg("dim", ` (${partialArgs.agent})`)
-          : "";
+        // Only show the agent tag separately when a distinct cosmetic name was given.
+        const agent =
+          agentName && name !== agentName ? theme.fg("dim", ` (${agentName})`) : "";
         const cwdHint = typeof partialArgs.cwd === "string" && partialArgs.cwd
           ? theme.fg("dim", ` in ${partialArgs.cwd}`)
           : "";

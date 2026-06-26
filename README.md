@@ -122,7 +122,7 @@ The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot
 
 These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
-**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `worker`, or any `fork: true` spawn) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `worker`) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter.
 
 #### Configuration
 
@@ -147,33 +147,27 @@ cp config.json.example config.json
 ## Spawning Subagents
 
 ```typescript
-// Named agent with defaults from agent definition
-subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
+// Spawn an agent by its profile name
+subagent({ agent: "scout", task: "Analyze the codebase..." });
 
-// Force a full-context fork for this spawn
-subagent({ name: "Fix", fork: true, task: "Fix the bug where..." });
-
-// Interactive worker the user can drive in its own pane
-subagent({ name: "Worker", agent: "worker", task: "Implement the dark mode toggle" });
+// Cosmetic pane label (defaults to the agent name when omitted)
+subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode toggle" });
 
 // Custom working directory
-subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
+subagent({ agent: "game-designer", cwd: "agents/game-designer", task: "..." });
 ```
 
 ### Parameters
 
-| Parameter              | Type    | Default        | Description                                                                                       |
-| ---------------------- | ------- | -------------- | ------------------------------------------------------------------------------------------------- |
-| `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
-| `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
-| `agent`                | string  | required¹      | Agent profile to spawn (must be a known/permitted agent). ¹Optional only for a top-level `fork: true` clone |
-| `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
-| `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | —              | Override agent's default model                                                                    |
-| `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
-| `skills`               | string  | —              | Comma-separated skill names                                                                       |
-| `tools`                | string  | —              | Comma-separated tool names                                                                        |
-| `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+The schema is intentionally small: each agent has a fixed, well-defined loadout (model, tools, system prompt) baked into its definition, so per-spawn override knobs were removed. You pick an `agent` and give it a `task`.
+
+| Parameter | Type   | Default        | Description                                                                                  |
+| --------- | ------ | -------------- | -------------------------------------------------------------------------------------------- |
+| `agent`   | string | required       | Which agent to spawn. Must be a known/permitted agent (see [`subagents_list`](#subagents_list)). Loads that agent's fixed profile. |
+| `task`    | string | required       | Task prompt for the sub-agent                                                                |
+| `name`    | string | _agent name_   | Optional cosmetic label for the pane and widget row. Defaults to the agent name. Does not select the agent. |
+| `model`   | string | —              | Override the agent's default model for this spawn                                            |
+| `cwd`     | string | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                      |
 
 ---
 
@@ -285,9 +279,7 @@ Choose how a subagent session starts:
 - `lineage-only` — fresh blank child session with `parentSession` linkage, but no copied turns from the caller
 - `fork` — linked child session seeded with the caller's prior conversation context
 
-`lineage-only` is useful when you want session discovery and fork lineage UX to show the relationship later, but you do **not** want the child to inherit the parent's turns.
-
-`fork: true` on the tool call always forces the `fork` mode for that specific spawn.
+`lineage-only` is useful when you want session discovery and fork lineage UX to show the relationship later, but you do **not** want the child to inherit the parent's turns. Set the mode per agent via the `session-mode` frontmatter field below.
 
 ```yaml
 ---
@@ -322,7 +314,7 @@ auto-exit: true
 
 Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
 
-**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. a `fork: true` spawn) are treated as interactive.
+**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet.
 
 **Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Child snapshots still update the widget, but stalled/recovered supervision messages rarely need to wake the parent for user-driven sessions. Skipping the steer keeps the parent quiet until the child actually finishes.
 
@@ -338,12 +330,6 @@ name: worker
 ---
 ```
 
-Or per spawn:
-
-```typescript
-subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
-```
-
 ---
 
 ## Tool Access Control
@@ -357,7 +343,7 @@ The agent whitelist is enforced at **every** depth, not just for restricted sub-
 - A **restricted sub-agent** (one launched with `PI_SUBAGENT_ALLOWED`) may only spawn the agents pinned in its `subagent_agents` list.
 - A **top-level session** may spawn any agent that appears in `subagents_list` (every discoverable definition).
 
-Every `subagent` call must set `agent` to a name in the caller's permitted set. A missing `agent`, or one that doesn't resolve to a real definition (e.g. `agent: "wizard"`), is rejected — it no longer silently falls back to an unrestricted, full-toolset child. The only agentless spawn allowed is a top-level `fork: true` clone, which carries the caller's own already-trusted toolset.
+Every `subagent` call must set `agent` to a name in the caller's permitted set. A missing `agent`, or one that doesn't resolve to a real definition (e.g. `agent: "wizard"`), is rejected — there is no agentless spawn route, so a child can never launch with an unrestricted, full-toolset profile by omitting its agent.
 
 ### Granting the ability to spawn: `subagent_agents`
 
