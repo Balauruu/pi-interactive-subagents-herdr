@@ -1,4 +1,13 @@
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
@@ -81,6 +90,87 @@ function readEntries(sessionFile: string): SessionEntry[] {
 export function getLeafId(sessionFile: string): string | null {
   const entries = readEntries(sessionFile);
   return entries.length > 0 ? entries[entries.length - 1].id : null;
+}
+
+/**
+ * Read the canonical session id from a session file's header.
+ *
+ * pi's `--session <id>` flag resolves against this header `id` (exact match,
+ * then prefix), NOT the filename — so this is the value to hand back to the
+ * orchestrator for follow-ups.
+ */
+export function getSessionId(sessionFile: string): string | null {
+  try {
+    const raw = readFileSync(sessionFile, "utf8");
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const entry = JSON.parse(trimmed) as { type?: string; id?: string };
+      if (entry.type === "session" && typeof entry.id === "string") {
+        return entry.id;
+      }
+      // Header is always the first entry; bail after the first parse.
+      break;
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
+function readHeaderId(sessionFile: string): string | null {
+  try {
+    const raw = readFileSync(sessionFile, "utf8");
+    const firstLine = raw.split("\n", 1)[0]?.trim();
+    if (!firstLine) return null;
+    const entry = JSON.parse(firstLine) as { type?: string; id?: string };
+    return entry.type === "session" && typeof entry.id === "string" ? entry.id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve a session id (or id prefix) to a session file path by scanning every
+ * `*.jsonl` under `sessionsRoot` and matching the header `id`. Mirrors pi's own
+ * resolution order: exact match first, then prefix match. Most recently
+ * modified file wins on ties. Returns null when nothing matches.
+ */
+export function resolveSessionFileById(sessionId: string, sessionsRoot: string): string | null {
+  if (!sessionId || !existsSync(sessionsRoot)) return null;
+
+  const candidates: Array<{ path: string; id: string; mtime: number }> = [];
+  const walk = (dir: string) => {
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        const id = readHeaderId(full);
+        if (!id) continue;
+        let mtime = 0;
+        try {
+          mtime = statSync(full).mtimeMs;
+        } catch {
+          /* ignore */
+        }
+        candidates.push({ path: full, id, mtime });
+      }
+    }
+  };
+  walk(sessionsRoot);
+
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  const exact = candidates.find((c) => c.id === sessionId);
+  if (exact) return exact.path;
+  const prefix = candidates.find((c) => c.id.startsWith(sessionId));
+  return prefix ? prefix.path : null;
 }
 
 /**

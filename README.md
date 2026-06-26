@@ -62,14 +62,13 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 1 command, plus 1 subagent-only tool:
+**Subagents** — 3 main-session tools + 1 command, plus 1 subagent-only tool:
 
-| Tool                 | Description                                                                                 |
-| -------------------- | ------------------------------------------------------------------------------------------- |
-| `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
-| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
-| `subagents_list`     | List available agent definitions                                                            |
-| `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+| Tool               | Description                                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------------------- |
+| `subagent`         | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)                   |
+| `subagent_message` | Steer a running subagent (by `name`) or resume a finished one (by `sessionId`)                    |
+| `subagents_list`   | List available agent definitions                                                                  |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -167,7 +166,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | ---------------------- | ------- | -------------- | ------------------------------------------------------------------------------------------------- |
 | `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
-| `agent`                | string  | —              | Load defaults from agent definition                                                               |
+| `agent`                | string  | required¹      | Agent profile to spawn (must be a known/permitted agent). ¹Optional only for a top-level `fork: true` clone |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | —              | Override agent's default model                                                                    |
@@ -178,42 +177,48 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 ---
 
-## Interrupting a running subagent
+## Messaging a subagent
 
-Use `subagent_interrupt` to cancel the active turn of a running Pi-backed subagent:
+`subagent_message` is the single tool for talking to a subagent after it has been spawned. It has two modes, selected by which argument you pass:
+
+**Steer a running subagent** — pass `name` to type a follow-up instruction directly into the live pane:
 
 ```typescript
-subagent_interrupt({ id: "abcd1234" });
-// or
-subagent_interrupt({ name: "Scout" });
+subagent_message({ name: "Scout", message: "Also check the auth middleware" });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately moves the child back to `waiting`, and stale pre-interrupt snapshots are ignored. If the child starts work later, newer snapshots return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+The message is delivered into the child's TUI editor (newlines are flattened to spaces so it fires as one turn). The child picks it up at its next turn boundary. The call returns immediately and does **not**, by itself, produce a new result — the subagent's eventual completion still arrives as a steer message. The widget moves the child to `waiting` until it resumes work.
 
-This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
+**Resume a finished subagent** — pass `sessionId` (returned in the completed subagent's result) to relaunch and continue that session:
 
-> **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
+```typescript
+subagent_message({ sessionId: "019f05b2-f1c3", message: "Now write the tests too" });
+```
+
+Resuming is fire-and-forget async: the relaunched session's result is delivered later as a steer message, exactly like a fresh `subagent` spawn.
+
+> **Guard:** a `sessionId` that maps to a still-running subagent is rejected — resuming would launch a second process mutating the same session file. Steer it by `name` instead. There is no hard-abort tool; to forcibly stop a subagent, use its pane directly.
+
+**`subagent_message` parameters:**
+- `name` — exact display name of a running subagent to steer (mutually exclusive with `sessionId`)
+- `sessionId` — id (or id prefix) of a finished session to resume (mutually exclusive with `name`)
+- `message` (required) — the instruction or next task to deliver
+- `autoExit` (resume only) — whether the resumed session auto-exits after its next response. Defaults to `true`; set `false` for an interactive handoff.
 
 ---
 
 ## caller_ping — Child-to-Parent Help Request
 
-The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
+The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message, including the session id. The parent can then **resume** the child session with a response using `subagent_message`.
 
 **`caller_ping` parameters:**
 - `message` (required): What you need help with
 
-**`subagent_resume` parameters:**
-- `sessionPath` (required): Path to the child session `.jsonl` file
-- `name` (optional): Display name for the resumed pane (defaults to `Resume`)
-- `message` (optional): Follow-up prompt to send after resuming
-- `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
-
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)
-3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
-4. Parent resumes the child session via `subagent_resume` with the response
+3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"* plus the session id
+4. Parent resumes the child session via `subagent_message({ sessionId, message })` with the response
 5. Child picks up where it left off with the parent's guidance
 
 **Example:**
@@ -260,7 +265,7 @@ The `tools` field is a strict allowlist. The child process is launched with exte
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
 | `tools`       | string  | Strict allowlist of tool names. Built-ins (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) plus custom-extension tools (`web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`). Only the extensions backing these tools are loaded into the child. |
-| `subagent_agents` | string | Comma-separated list of agent names this agent may spawn. **Presence of this field grants the full spawning toolset** (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`) and restricts spawn targets to the listed agents. Omit it and the agent cannot spawn at all. |
+| `subagent_agents` | string | Comma-separated list of agent names this agent may spawn. **Presence of this field grants the full spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the listed agents. Omit it and the agent cannot spawn at all. |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, researcher); not for interactive ones (worker). Also determines the default value of `interactive` (see below). |
@@ -345,11 +350,20 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 
 Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`. Only the tools named in the agent's `tools` frontmatter are exposed, and only the extensions that register those tools are loaded back in via explicit `--extension` flags. There is no global default toolset and no deny-list to maintain — an agent gets exactly what it asks for.
 
+### Spawns must name a known agent
+
+The agent whitelist is enforced at **every** depth, not just for restricted sub-agents:
+
+- A **restricted sub-agent** (one launched with `PI_SUBAGENT_ALLOWED`) may only spawn the agents pinned in its `subagent_agents` list.
+- A **top-level session** may spawn any agent that appears in `subagents_list` (every discoverable definition).
+
+Every `subagent` call must set `agent` to a name in the caller's permitted set. A missing `agent`, or one that doesn't resolve to a real definition (e.g. `agent: "wizard"`), is rejected — it no longer silently falls back to an unrestricted, full-toolset child. The only agentless spawn allowed is a top-level `fork: true` clone, which carries the caller's own already-trusted toolset.
+
 ### Granting the ability to spawn: `subagent_agents`
 
 Spawning is **off by default**. An agent cannot spawn sub-agents unless its frontmatter declares a `subagent_agents` list. Presence of that field:
 
-1. Grants the full spawning toolset (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`) — you do **not** list these in `tools`.
+1. Grants the full spawning toolset (`subagent`, `subagent_message`, `subagents_list`) — you do **not** list these in `tools`.
 2. Loads this extension into the child process.
 3. Restricts the child to spawning **only** the named agents. The child's `subagents_list` is filtered to that set, and `subagent` calls for any other agent are rejected. Enforced via the `PI_SUBAGENT_ALLOWED` env var.
 

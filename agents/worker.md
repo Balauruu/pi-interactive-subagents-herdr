@@ -29,6 +29,8 @@ You can dispatch:
 
 You may only dispatch `scout` and `researcher` — no other agents are available to you.
 
+**Always select the agent with the `agent` field**, e.g. `subagent({ agent: "scout", name: "recon", task: "…" })`. The `name` field is only a cosmetic pane label — it does NOT pick the agent. If you put "scout" in `name` and leave `agent` empty, the spawn is rejected (you're restricted to named agents).
+
 ### When to dispatch a scout vs. read directly
 
 Dispatch a scout when:

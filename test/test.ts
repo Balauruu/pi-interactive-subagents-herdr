@@ -10,6 +10,8 @@ import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
   getLeafId,
   getNewEntries,
+  getSessionId,
+  resolveSessionFileById,
   findLastAssistantMessage,
   appendBranchSummary,
   copySessionFile,
@@ -256,6 +258,40 @@ describe("session.ts", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE]);
       const entries = getNewEntries(file, 2);
       assert.equal(entries.length, 0);
+    });
+  });
+
+  describe("getSessionId / resolveSessionFileById", () => {
+    function writeSession(d: string, fname: string, id: string): string {
+      const p = join(d, fname);
+      writeFileSync(p, JSON.stringify({ type: "session", id, version: 3 }) + "\n");
+      return p;
+    }
+
+    it("reads the header id from a session file", () => {
+      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG]);
+      assert.equal(getSessionId(file), "sess-001");
+    });
+
+    it("returns null for a file without a session header", () => {
+      const file = createSessionFile(dir, [USER_MSG]);
+      assert.equal(getSessionId(file), null);
+    });
+
+    it("resolves a session file by exact id under the root", () => {
+      const a = writeSession(dir, "a.jsonl", "019f-aaaa");
+      writeSession(dir, "b.jsonl", "019f-bbbb");
+      assert.equal(resolveSessionFileById("019f-aaaa", dir), a);
+    });
+
+    it("resolves a session file by id prefix", () => {
+      const a = writeSession(dir, "p.jsonl", "019f-prefix-match");
+      assert.equal(resolveSessionFileById("019f-prefix", dir), a);
+    });
+
+    it("returns null when no session matches", () => {
+      writeSession(dir, "c.jsonl", "abc");
+      assert.equal(resolveSessionFileById("zzz", dir), null);
     });
   });
 
@@ -1085,7 +1121,7 @@ describe("subagent discovery", () => {
     const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
     assert.ok(allowlist, "expected an allowlist");
     const tools = new Set(allowlist!.split(","));
-    for (const t of ["subagent", "subagent_interrupt", "subagents_list", "subagent_resume"]) {
+    for (const t of ["subagent", "subagent_message", "subagents_list"]) {
       assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
     }
     assert.ok(tools.has("safe_bash"), "expected worker to keep safe_bash");
@@ -1484,6 +1520,46 @@ describe("tool registration", () => {
   });
 
 
+  it("rejects a top-level spawn with no agent and no fork", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagentTool, "expected subagent tool to be registered");
+
+    const result = await subagentTool.execute("call-1", { name: "x", task: "do it" });
+    assert.equal(result.details?.error, "agent required");
+    assert.match(result.content[0].text, /specify which agent/i);
+  });
+
+  it("rejects a top-level spawn naming an unknown agent", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagentTool, "expected subagent tool to be registered");
+
+    const result = await subagentTool.execute("call-1", {
+      name: "x",
+      task: "do it",
+      agent: "wizard",
+    });
+    assert.equal(result.details?.error, "unknown agent");
+    assert.match(result.content[0].text, /not a known agent/i);
+  });
+
+  it("documents that `agent` (not `name`) selects the agent profile", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagentTool, "expected subagent tool to be registered");
+
+    const props = subagentTool.parameters.properties;
+    // `name` must clarify it is cosmetic and does NOT select a profile.
+    assert.match(props.name.description, /does NOT select/i);
+    // `agent` must steer the model to set it for a specific profile.
+    assert.match(props.agent.description, /which agent profile to spawn/i);
+  });
+
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -1505,16 +1581,30 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers subagent_resume with an autoExit override", () => {
+  it("registers subagent_message with name, sessionId, message, and an autoExit override", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
-    assert.ok(resumeTool, "expected subagent_resume tool to be registered");
+    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+    assert.ok(messageTool, "expected subagent_message tool to be registered");
 
-    const autoExitSchema = resumeTool.parameters.properties.autoExit;
+    const props = messageTool.parameters.properties;
+    assert.ok(props.name, "expected name param");
+    assert.ok(props.sessionId, "expected sessionId param");
+    assert.equal(props.message.type, "string");
+    assert.equal(messageTool.parameters.required?.includes("message"), true);
+
+    const autoExitSchema = props.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
+  });
+
+  it("no longer registers subagent_interrupt or subagent_resume", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const names = registeredTools.map((tool) => tool.name);
+    assert.equal(names.includes("subagent_interrupt"), false);
+    assert.equal(names.includes("subagent_resume"), false);
   });
 });
 
@@ -1705,15 +1795,16 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_interrupt in the main session extension", () => {
+  it("registers subagent_message and not the old interrupt/resume tools", () => {
     const { api, registeredTools } = createMockExtensionApi();
-
     (subagentsModule as any).default(api);
-
-    assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
+    const names = registeredTools.map((tool) => tool.name);
+    assert.equal(names.includes("subagent_message"), true);
+    assert.equal(names.includes("subagent_interrupt"), false);
+    assert.equal(names.includes("subagent_resume"), false);
   });
 
-  it("resolves interrupt targets by exact id and reports name ambiguity", () => {
+  it("resolves a running subagent by exact name and reports ambiguity", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -1723,147 +1814,51 @@ describe("subagent interruption", () => {
       runningMap.set("b2", makeRunning({ id: "b2", name: "Worker", surface: "b2", sessionFile: "b2.jsonl" }));
       runningMap.set("c3", makeRunning({ id: "c3", name: "Scout", surface: "c3", sessionFile: "c3.jsonl" }));
 
-      const byId = testApi.resolveInterruptTarget({ id: "c3", name: "Worker" });
-      assert.equal(byId.running.id, "c3");
+      const byName = testApi.resolveRunningByName("Scout");
+      assert.equal(byName.running.id, "c3");
 
-      const ambiguous = testApi.resolveInterruptTarget({ name: "Worker" });
+      const ambiguous = testApi.resolveRunningByName("Worker");
       assert.match(ambiguous.error, /Ambiguous subagent name/);
+
+      const missing = testApi.resolveRunningByName("Ghost");
+      assert.match(missing.error, /No running subagent named "Ghost"/);
     } finally {
       runningMap.clear();
     }
   });
 
-  it("returns an explicit error when Escape delivery fails", () => {
+  it("steers a running subagent by typing into its pane (newlines flattened)", () => {
     const testApi = (subagentsModule as any).__test__;
-    let aborted = false;
-    const running = makeRunning({
-      abortController: {
-        abort() {
-          aborted = true;
-        },
-      },
-    });
-
-    const result = testApi.requestSubagentInterrupt(running, () => {
-      throw new Error("mux write failed");
-    });
-
-    assert.match(result.error, /Failed to send Escape/);
-    assert.equal(aborted, false);
-    assert.equal("interruptRequested" in running, false);
-  });
-
-  it("leaves status unchanged when Escape delivery fails in the tool path", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
-    runningMap.clear();
-
-    const activeState = observeStatus(
-      createStatusState({ source: "pi", startTimeMs: 0 }),
-      {
-        snapshot: "present",
-        updatedAt: 5_000,
-        sequence: 1,
-        phase: "active",
-        active: true,
-        activeScope: "tool",
-        activeSince: 5_000,
-        activityLabel: "bash",
-      },
-      5_000,
-    );
-
-    try {
-      runningMap.set("a1", makeRunning({ statusState: activeState }));
-
-      const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
-        throw new Error("mux write failed");
-      }));
-
-      assert.match(result.content[0].text, /Failed to send Escape/);
-      assert.equal(classifyStatus(runningMap.get("a1").statusState, 20_000).kind, "active");
-    } finally {
-      runningMap.clear();
-    }
-  });
-
-  it("sends Escape without aborting or mutating running state", () => {
-    const testApi = (subagentsModule as any).__test__;
-    let aborted = false;
     let sentSurface = "";
-    const running = makeRunning({
-      abortController: {
-        abort() {
-          aborted = true;
-        },
-      },
-    });
+    let sentText = "";
+    const running = makeRunning();
 
-    const result = testApi.requestSubagentInterrupt(running, (surface: string) => {
+    const result = testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
       sentSurface = surface;
+      sentText = text;
     });
 
     assert.deepEqual(result, { ok: true });
     assert.equal(sentSurface, "pane-1");
-    assert.equal(aborted, false);
-    assert.equal("interruptRequested" in running, false);
+    assert.equal(sentText, "do this then that");
   });
 
-  it("refreshes the latest activity snapshot before forcing local interrupt waiting", () => {
+  it("returns an explicit error when steering delivery fails", () => {
     const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
-    let sentSurface = "";
-    runningMap.clear();
+    const running = makeRunning();
 
-    withTempDir((dir) => {
-      mkdirSync(join(dir, "subagent-activity"), { recursive: true });
-      const activityFile = getSubagentActivityFile(dir, "a1");
-      const activity = {
-        version: 1,
-        runningChildId: "a1",
-        createdAt: 1_000,
-        updatedAt: 19_000,
-        sequence: 7,
-        latestEvent: "tool_execution_start",
-        phase: "active",
-        agentActive: true,
-        turnActive: true,
-        providerActive: false,
-        toolActive: true,
-        activeScope: "tool",
-        activeSince: 19_000,
-        toolName: "bash",
-      };
-      writeFileSync(activityFile, `${JSON.stringify(activity)}\n`);
-
-      try {
-        runningMap.set("a1", makeRunning({
-          activityFile,
-          statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
-        }));
-
-        withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-          sentSurface = surface;
-        }));
-
-        assert.equal(sentSurface, "pane-1");
-        const state = runningMap.get("a1").statusState;
-        const snapshot = classifyStatus(state, 20_000);
-        assert.equal(snapshot.kind, "waiting");
-        assert.equal(snapshot.activityLabel, "interrupted");
-        assert.equal(state.lastActivityAtMs, 20_000);
-        assert.equal(state.lastActivitySequence, 7);
-        assert.equal(state.localOverrideSequence, 7);
-      } finally {
-        runningMap.clear();
-      }
+    const result = testApi.steerSubagent(running, "hi", () => {
+      throw new Error("mux write failed");
     });
+
+    assert.match(result.error, /Failed to deliver message/);
   });
 
-  it("acknowledges Pi-backed interrupt requests and forces local status waiting", () => {
+  it("delivers a steer message and forces local status waiting", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
+    let sentText = "";
     runningMap.clear();
 
     const activeState = observeStatus(
@@ -1884,65 +1879,69 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-        sentSurface = surface;
-      }));
+      const result = withMockedNow(20_000, () =>
+        testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
+          sentSurface = surface;
+          sentText = text;
+        }),
+      );
 
       assert.equal(sentSurface, "pane-1");
-      assert.equal(result.content[0].text, 'Interrupt requested for subagent "Worker".');
-      assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "interrupt_requested" });
+      assert.equal(sentText, "keep going");
+      assert.equal(result.content[0].text.includes('Message delivered to running subagent "Worker"'), true);
+      assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "steered" });
       const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
       assert.equal(snapshot.kind, "waiting");
-      assert.equal(snapshot.activityLabel, "interrupted");
       assert.equal(runningMap.has("a1"), true);
     } finally {
       runningMap.clear();
     }
   });
 
-  it("sends Escape again for repeated interrupt requests", () => {
+  it("requires a message when steering", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
-    const surfaces: string[] = [];
     runningMap.clear();
-
     try {
       runningMap.set("a1", makeRunning());
-
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-        surfaces.push(surface);
-      });
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-        surfaces.push(surface);
-      });
-
-      assert.deepEqual(surfaces, ["pane-1", "pane-1"]);
-      assert.equal(runningMap.has("a1"), true);
+      const result = testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
+      assert.match(result.content[0].text, /`message` is required/);
     } finally {
       runningMap.clear();
     }
   });
 
-  it("rejects Claude-backed interrupt requests before delivery", () => {
+  it("leaves status unchanged when steering delivery fails in the tool path", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
-    let delivered = false;
     runningMap.clear();
 
+    const activeState = observeStatus(
+      createStatusState({ source: "pi", startTimeMs: 0 }),
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      5_000,
+    );
+
     try {
-      runningMap.set("a1", makeRunning({ cli: "claude" }));
+      runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
-        delivered = true;
-      });
+      const result = withMockedNow(20_000, () =>
+        testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
+          throw new Error("mux write failed");
+        }),
+      );
 
-      assert.equal(delivered, false);
-      assert.match(result.content[0].text, /currently supported only for Pi-backed subagents/i);
-      assert.deepEqual(result.details, {
-        error: "claude interrupt unsupported",
-        id: "a1",
-        name: "Worker",
-      });
+      assert.match(result.content[0].text, /Failed to deliver message/);
+      assert.equal(classifyStatus(runningMap.get("a1").statusState, 20_000).kind, "active");
     } finally {
       runningMap.clear();
     }
@@ -1956,13 +1955,15 @@ describe("subagent interruption", () => {
         elapsed: 61,
         summary: "Sub-agent exited with code 130",
         sessionFile: "/tmp/subagent.jsonl",
+        sessionId: "019f-abc",
       },
       "Worker",
     );
 
     assert.match(presentation, /failed \(exit code 130\)/);
     assert.doesNotMatch(presentation, /interrupted/);
-    assert.match(presentation, /Resume: pi --session/);
+    assert.match(presentation, /Session id: 019f-abc/);
+    assert.match(presentation, /subagent_message/);
   });
 
   it("renders a clear provider/agent error when errorMessage is set", () => {
@@ -1978,6 +1979,7 @@ describe("subagent interruption", () => {
         elapsed: 14,
         summary: "ignored when errorMessage is present",
         sessionFile: "/tmp/subagent.jsonl",
+        sessionId: "019f-xyz",
         errorMessage: "Anthropic 529 Overloaded after 3 retries",
       },
       "Worker",
@@ -1986,8 +1988,8 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
-    assert.match(presentation, /subagent_resume/);
-    assert.match(presentation, /Resume: pi --session/);
+    assert.match(presentation, /subagent_message/);
+    assert.match(presentation, /Session id: 019f-xyz/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
   });
 });
