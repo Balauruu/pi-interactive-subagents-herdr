@@ -1,7 +1,16 @@
 /**
  * Extension loaded into sub-agents.
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+Alt+O)
- * - Provides a `subagent_done` tool for autonomous agents to self-terminate
+ * - Provides an `ask_question` tool for asking the parent orchestrator a question
+ *
+ * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
+ * automatically when their agent loop ends (see the `agent_end` handler);
+ * interactive agents end when the human exits the pane.
+ *
+ * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
+ * signal the parent's watcher picks up, parks the session in a "waiting" state
+ * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
+ * replies with subagent_message — which lands as the subagent's next turn.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
@@ -11,6 +20,32 @@ import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
+}
+
+/**
+ * Number of child subagents this session itself still has in flight.
+ *
+ * When this extension is loaded inside a subagent that can spawn its own
+ * children (e.g. a worker delegating to scout/researcher), `index.ts` runs in
+ * the same process and publishes a live count through a shared process-global
+ * symbol. A subagent that spawns children and then writes a "waiting for
+ * results" message would otherwise auto-exit the instant that turn ends —
+ * killing the session before its children report back. Reading this count lets
+ * `agent_end` keep the session open until every child has finished and its
+ * result has been delivered.
+ *
+ * Returns 0 when the spawning tools aren't loaded (scout/researcher, or a
+ * standalone session), so those agents auto-exit exactly as before.
+ */
+export function runningChildrenCount(): number {
+  const fn = (globalThis as any)[Symbol.for("pi-subagents/running-children-count")];
+  if (typeof fn !== "function") return 0;
+  try {
+    const n = fn();
+    return typeof n === "number" && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
 }
 
 export function shouldAutoExitOnAgentEnd(
@@ -143,6 +178,10 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  // Set when ask_question is called; suppresses auto-exit for that turn so the
+  // session stays open while it waits for the orchestrator's reply. Cleared at
+  // the start of the next turn (when the reply lands).
+  let awaitingAnswer = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -168,12 +207,27 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    // A new turn is starting — any pending ask_question has now been answered
+    // (or superseded), so let auto-exit resume normally when this turn ends.
+    awaitingAnswer = false;
     recorder.agentStart();
   });
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    // Never shut down while this session still has work in flight:
+    //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
+    //  - runningChildrenCount(): this subagent spawned its own children and is
+    //    waiting for their results (delivered as steered turns). Exiting now
+    //    would strand those children and drop their results.
+    // In both cases the session parks as `waiting` and resumes when the next
+    // turn lands.
+    const hasPendingChildren = runningChildrenCount() > 0;
+    const shouldExit =
+      !awaitingAnswer &&
+      !hasPendingChildren &&
+      autoExit &&
+      shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -266,59 +320,70 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "caller_ping",
-    label: "Caller Ping",
+    name: "ask_question",
+    label: "ask_question",
     description:
-      "Send a help request to the parent agent and exit this session. " +
-      "The parent will be notified with your message and can resume this session with a response. " +
-      "Use when you're stuck, need clarification, or need the parent to take action.",
+      "Ask the orchestrator (the parent agent that spawned you) a single question and pause until they reply. " +
+      "Use this when requirements are ambiguous, a decision would materially affect your work, you're blocked, " +
+      "or you need information or confirmation only the orchestrator has. Prefer asking over guessing. " +
+      "Your session stays open while you wait — the answer arrives as your next message, then you continue. " +
+      "Ask exactly one question per call; make separate calls for unrelated questions.",
+    promptSnippet:
+      "Use this tool to ask the orchestrator one clarifying, missing-requirement, preference, or decision question before continuing — instead of guessing.",
+    promptGuidelines: [
+      "Ask exactly one question per tool call.",
+      "If you need answers to multiple things, make separate ask_question calls instead of bundling them.",
+      "Prefer this tool over guessing when requirements, preferences, or implementation choices are unclear.",
+      "Use it when multiple valid paths exist and the right one depends on the orchestrator's intent.",
+      "Give enough context in the question that the orchestrator can answer without re-reading your whole task.",
+      "After asking, stop and wait — the reply will arrive as your next message.",
+    ],
     parameters: Type.Object({
-      message: Type.String({ description: "What you need help with" }),
+      question: Type.String({
+        description:
+          "The single freeform question to ask the orchestrator. Include enough context to answer it directly.",
+      }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (!sessionFile) {
         throw new Error(
-          "caller_ping is only available in subagent contexts. " +
+          "ask_question is only available in subagent contexts. " +
             "PI_SUBAGENT_SESSION environment variable is not set.",
         );
       }
 
-      recorder.callerPing();
-      const exitData = {
-        type: "ping" as const,
+      // Keep the session open: suppress auto-exit for this turn and park in the
+      // "waiting" phase. The parent's watcher picks up the `.ask` signal and
+      // notifies the orchestrator, who replies via subagent_message.
+      awaitingAnswer = true;
+      recorder.askQuestion();
+      const askData = {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
-        message: params.message,
+        agent: process.env.PI_SUBAGENT_AGENT ?? "",
+        question: params.question,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
 
-      ctx.shutdown();
       return {
-        content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
-        details: {},
+        content: [
+          {
+            type: "text",
+            text:
+              "Question sent to the orchestrator. Stop here and wait — do not continue working or " +
+              "assume an answer. Their reply will arrive as your next message.",
+          },
+        ],
+        details: { question: params.question },
       };
+    },
+
+    renderCall(args, theme) {
+      const text =
+        theme.fg("toolTitle", theme.bold("ask_question ")) +
+        theme.fg("muted", String((args as any).question ?? ""));
+      return new Text(text, 0, 0);
     },
   });
 
-  pi.registerTool({
-    name: "subagent_done",
-    label: "Subagent Done",
-    description:
-      "Call this tool when you have completed your task. " +
-      "It will close this session and return your results to the main session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
-    parameters: Type.Object({}),
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      recorder.subagentDone();
-      if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
-      }
-      ctx.shutdown();
-      return {
-        content: [{ type: "text", text: "Shutting down subagent session." }],
-        details: {},
-      };
-    },
-  });
 }

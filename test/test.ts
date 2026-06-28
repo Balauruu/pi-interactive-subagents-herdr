@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -56,7 +56,9 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
+import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
 // --- Helpers ---
@@ -1179,7 +1181,7 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
+      "read,bash,web_search,ask_question",
     );
   });
 
@@ -1389,19 +1391,116 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError([]), null);
     });
   });
+
+  describe("runningChildrenCount", () => {
+    const KEY = Symbol.for("pi-subagents/running-children-count");
+    function withGlobal(value: unknown, run: () => void) {
+      const prev = (globalThis as any)[KEY];
+      (globalThis as any)[KEY] = value;
+      try {
+        run();
+      } finally {
+        (globalThis as any)[KEY] = prev;
+      }
+    }
+
+    it("returns 0 when the spawning tools aren't loaded (no global)", () => {
+      withGlobal(undefined, () => {
+        assert.equal(runningChildrenCount(), 0);
+      });
+    });
+
+    it("reflects the live child count published by index.ts", () => {
+      withGlobal(() => 3, () => {
+        assert.equal(runningChildrenCount(), 3);
+      });
+    });
+
+    it("treats zero/negative/non-number/throwing getters as 0", () => {
+      withGlobal(() => 0, () => assert.equal(runningChildrenCount(), 0));
+      withGlobal(() => -1, () => assert.equal(runningChildrenCount(), 0));
+      withGlobal(() => "two", () => assert.equal(runningChildrenCount(), 0));
+      withGlobal(() => { throw new Error("boom"); }, () => assert.equal(runningChildrenCount(), 0));
+    });
+  });
+
+  describe("ask_question tool", () => {
+    function setupSubagentExtension(sessionFile: string) {
+      const saved = {
+        session: process.env.PI_SUBAGENT_SESSION,
+        name: process.env.PI_SUBAGENT_NAME,
+        agent: process.env.PI_SUBAGENT_AGENT,
+        autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+      };
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+      process.env.PI_SUBAGENT_NAME = "scout-2";
+      process.env.PI_SUBAGENT_AGENT = "scout";
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      const mock = createMockExtensionApi();
+      subagentDoneExtension(mock.api);
+      const restore = () => {
+        restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
+        restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
+        restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+      };
+      return { mock, restore };
+    }
+
+    it("registers ask_question (and no caller_ping) with a single freeform question param", () => {
+      const dir = createTestDir();
+      const { mock, restore } = setupSubagentExtension(join(dir, "s.jsonl"));
+      try {
+        const names = mock.registeredTools.map((t) => t.name);
+        assert.ok(names.includes("ask_question"));
+        assert.ok(!names.includes("caller_ping"));
+        const tool = mock.registeredTools.find((t) => t.name === "ask_question");
+        assert.deepEqual(Object.keys(tool.parameters.properties), ["question"]);
+        assert.match(tool.description, /orchestrator/i);
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("writes a .ask signal with name/agent/question and does NOT shut the session down", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { mock, restore } = setupSubagentExtension(sessionFile);
+      try {
+        const tool = mock.registeredTools.find((t) => t.name === "ask_question");
+        let shutdownCalled = false;
+        const ctx = { shutdown() { shutdownCalled = true; } } as any;
+        const out = await tool.execute("call-1", { question: "Which API base URL?" }, undefined, undefined, ctx);
+
+        assert.equal(shutdownCalled, false, "ask_question must keep the session open");
+        assert.match(out.content[0].text, /wait/i);
+
+        const askFile = `${sessionFile}.ask`;
+        assert.ok(existsSync(askFile), ".ask signal file should be written");
+        const payload = JSON.parse(readFileSync(askFile, "utf-8"));
+        assert.equal(payload.question, "Which API base URL?");
+        assert.equal(payload.name, "scout-2");
+        assert.equal(payload.agent, "scout");
+        // No .exit sidecar — the session is not exiting.
+        assert.ok(!existsSync(`${sessionFile}.exit`));
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 describe("cmux.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
-  it("decodes ping payloads", () => {
+  it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
+    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
+    // unknown `type: "ping"` payload now falls through to a clean done.
     assert.deepEqual(
       interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      {
-        reason: "ping",
-        exitCode: 0,
-        ping: { name: "Worker", message: "need help" },
-      },
+      { reason: "done", exitCode: 0 },
     );
   });
 
@@ -1638,7 +1737,7 @@ describe("subagent activity snapshots", () => {
       assert.equal(read.activity.waitingSince, 3_000);
 
       currentNow = 4_000;
-      recorder.subagentDone();
+      recorder.agentEndDone();
       read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "done");

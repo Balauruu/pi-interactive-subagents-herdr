@@ -20,8 +20,7 @@ export type SubagentActivityEvent =
   | "tool_execution_update"
   | "tool_result"
   | "tool_execution_end"
-  | "caller_ping"
-  | "subagent_done"
+  | "ask_question"
   | "session_shutdown";
 
 export interface SubagentActivityState {
@@ -70,8 +69,7 @@ export interface SubagentActivityRecorder {
   toolExecutionUpdate(toolCallId?: string, toolName?: string): void;
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
-  callerPing(): void;
-  subagentDone(): void;
+  askQuestion(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
 }
 
@@ -95,8 +93,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "tool_execution_update",
   "tool_result",
   "tool_execution_end",
-  "caller_ping",
-  "subagent_done",
+  "ask_question",
   "session_shutdown",
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
@@ -239,8 +236,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolExecutionUpdate() {},
     toolResult() {},
     toolExecutionEnd() {},
-    callerPing() {},
-    subagentDone() {},
+    askQuestion() {},
     sessionShutdown() {},
   };
 }
@@ -497,11 +493,15 @@ export function createSubagentActivityRecorder(params: {
         refreshActiveScope(current);
       }, "immediate");
     },
-    callerPing() {
-      markDone("caller_ping");
-    },
-    subagentDone() {
-      markDone("subagent_done");
+    askQuestion() {
+      // The subagent paused to ask the orchestrator a question. Park it in the
+      // "waiting" phase (do NOT disable the recorder) so the status widget shows
+      // it as waiting and recording resumes when the answer arrives.
+      record("ask_question", (current, observedAt) => {
+        clearActiveState(current);
+        current.phase = "waiting";
+        current.waitingSince = observedAt;
+      }, "immediate");
     },
     sessionShutdown(reason) {
       if (reason === "quit") markDone("session_shutdown");

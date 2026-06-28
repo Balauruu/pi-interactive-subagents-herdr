@@ -548,7 +548,6 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
-  ping?: { name: string; message: string };
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
 }
@@ -588,10 +587,21 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
+// When this extension is loaded inside a subagent that itself spawns children
+// (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
+// same process and needs to know whether this session still has children in
+// flight — so it can suppress auto-exit and keep the session open until they all
+// report back. Expose a live count through a process-global symbol that both
+// modules share. (subagent-done.ts reads it; if absent it assumes zero.)
+const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-count");
+(globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => runningSubagents.size;
+
 // ── Widget management ──
 
 /** Latest ExtensionContext from session_start, used for widget updates. */
 let latestCtx: ExtensionContext | null = null;
+/** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
+let latestPi: ExtensionAPI | null = null;
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -731,7 +741,7 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
 
 /**
  * Build the child --tools allowlist.
@@ -739,7 +749,7 @@ const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
  * Pi 0.70+ applies --tools to built-in, extension, and custom tools. If a
  * subagent definition restricts tools to e.g. "read,bash,write", the child
  * control tools from subagent-done.ts would otherwise be hidden, leaving a
- * manually resumed or user-touched subagent unable to call subagent_done.
+ * manually resumed or user-touched subagent unable to call ask_question.
  */
 function buildSubagentToolAllowlist(
   effectiveTools?: string,
@@ -1113,11 +1123,11 @@ async function launchSubagent(
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
   const modeHint = agentDefs?.autoExit
-    ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
+    ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
+    : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
   const summaryInstruction = agentDefs?.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+    : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
   // An agent with a non-empty subagent_agents list is granted the spawning
   // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
   const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
@@ -1377,6 +1387,50 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+/**
+ * Detect an `ask_question` signal from a still-running subagent and notify the
+ * orchestrator without ending the subagent. Each subagent has its own
+ * `${sessionFile}.ask` file and its own watcher, so parallel questions from
+ * multiple subagents are delivered independently. The file is deleted after
+ * delivery so it fires once per question (a subagent may ask again later).
+ */
+function deliverPendingQuestion(running: RunningSubagent): void {
+  const askFile = `${running.sessionFile}.ask`;
+  let payload: any = null;
+  try {
+    if (!existsSync(askFile)) return;
+    payload = JSON.parse(readFileSync(askFile, "utf-8"));
+  } catch {
+    // Malformed/partway-written file — drop it and move on.
+  }
+  try {
+    unlinkSync(askFile);
+  } catch {}
+  if (!payload?.question) return;
+
+  const name = running.name; // unique (deduped at spawn) — used to target the reply
+  const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
+  const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
+  const replyHint = sessionId
+    ? `\n\nReply with subagent_message({ name: "${name}", message: "…" }) while it runs (or sessionId: "${sessionId}" after it exits). It stays open until you reply.`
+    : `\n\nReply with subagent_message({ name: "${name}", message: "…" }). It stays open until you reply.`;
+
+  latestPi?.sendMessage(
+    {
+      customType: "subagent_question",
+      content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
+      display: true,
+      details: {
+        name,
+        agent: running.agent,
+        question: payload.question,
+        ...(sessionId ? { sessionId } : {}),
+      },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1390,6 +1444,7 @@ async function watchSubagent(
       sentinelFile: running.sentinelFile,
       onTick() {
         observeRunningSubagent(running);
+        deliverPendingQuestion(running);
       },
     });
 
@@ -1464,7 +1519,6 @@ async function watchSubagent(
       ...(subagentSessionId ? { sessionId: subagentSessionId } : {}),
       exitCode: result.exitCode,
       elapsed,
-      ping: result.ping,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
     };
@@ -1497,6 +1551,7 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  latestPi = pi;
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
@@ -1665,30 +1720,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
-
-            if (result.ping) {
-              // Subagent is requesting help — steer a ping with its session id so
-              // the orchestrator can reply via subagent_message.
-              const sessionRef = result.sessionId
-                ? `\n\nSession id: ${result.sessionId}\nReply with subagent_message({ name: "${result.ping.name}", message: "…" }) while it runs, or sessionId after it exits.`
-                : "";
-              pi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    agent: running.agent,
-                    sessionFile: result.sessionFile,
-                    ...(result.sessionId ? { sessionId: result.sessionId } : {}),
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
 
             const presentation = resolveResultPresentation(result, running.name);
 
@@ -2091,25 +2122,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then((result) => {
             updateWidget();
 
-            if (result.ping) {
-              const sessionRef = `\n\nSession id: ${resumedSessionId}\nReply with subagent_message({ name: "${result.ping.name}", message: "…" }) while it runs, or sessionId after it exits.`;
-              pi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    sessionFile: sessionPath,
-                    sessionId: resumedSessionId,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
-
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
               (result.errorMessage
@@ -2338,8 +2350,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     };
   });
 
-  // ── subagent_ping message renderer ──
-  pi.registerMessageRenderer("subagent_ping", (message, options, theme) => {
+  // ── subagent_question message renderer ──
+  pi.registerMessageRenderer("subagent_question", (message, options, theme) => {
     const details = message.details as any;
     if (!details) return undefined;
 
@@ -2350,19 +2362,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const bgFn = (text: string) => theme.bg("toolSuccessBg", text);
 
         const icon = theme.fg("accent", "?");
-        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— needs help")}`;
+        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— asks a question")}`;
 
         const contentLines = [header];
 
         if (options.expanded) {
           contentLines.push("");
-          contentLines.push(details.message ?? "");
-          if (details.sessionFile) {
+          contentLines.push(details.question ?? "");
+          if (details.sessionId) {
             contentLines.push("");
-            contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
+            contentLines.push(theme.fg("dim", `Session id: ${details.sessionId}`));
           }
         } else {
-          const preview = (details.message ?? "").split("\n")[0].slice(0, width - 10);
+          const preview = (details.question ?? "").split("\n")[0].slice(0, width - 10);
           contentLines.push(theme.fg("dim", preview));
           contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
         }

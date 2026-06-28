@@ -29,6 +29,26 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 
 Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
+### Pane layout (tmux)
+
+Under tmux, each subagent is a horizontal split off the parent pi pane. Left to itself, tmux halves the target pane on every split and dumps freed space onto a neighbor on close, so panes drift to wildly uneven widths. To prevent that, the extension automatically re-applies an even layout to the subagent window after every spawn and every exit (debounced so a burst of parallel spawns or staggered exits collapses into a single layout call). This only runs under tmux — cmux uses tabs, and zellij/wezterm manage their own layouts.
+
+The layout is a single constant in `pi-extension/subagents/cmux.ts`:
+
+```ts
+const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
+```
+
+Change it to switch the geometry, then reload the extension (or restart pi):
+
+| Value              | Geometry                                                                 |
+| ------------------ | ------------------------------------------------------------------------ |
+| `even-horizontal`  | Equal columns across the window (matches a manual `Ctrl+b` then `Alt+1`). Default. |
+| `main-vertical`    | One large main pane on the left, subagents tiled in a column on the right. |
+| `tiled`            | Grid of roughly equal panes — scales best when many subagents run at once. |
+
+The value is passed straight to `tmux select-layout`, so any named tmux layout works. An unrecognized value is ignored silently (the resize is best-effort and never blocks spawning), so double-check the spelling if a change seems to have no effect.
+
 ## What's Included
 
 ### Extensions
@@ -171,31 +191,37 @@ Resuming is fire-and-forget async: the relaunched session always runs its follow
 
 ---
 
-## caller_ping — Child-to-Parent Help Request
+## ask_question — Subagent Asks the Orchestrator
 
-The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message, including the session id. The parent can then **resume** the child session with a response using `subagent_message`.
+The `ask_question` tool lets a subagent ask its parent (the orchestrator that spawned it) a single freeform question — for ambiguous requirements, a decision that materially affects the work, a blocker, or confirmation only the parent has. It is framed like the top-level `ask_user_question` tool so agents reach for it proactively instead of guessing.
 
-**`caller_ping` parameters:**
-- `message` (required): What you need help with
+Unlike the old `caller_ping`, **the session stays open while it waits.** Auto-exit is suppressed for that turn, the subagent parks in a `waiting` state, and the parent replies with `subagent_message` — which lands as the subagent's next turn so it continues right where it paused.
+
+**`ask_question` parameters:**
+- `question` (required): The single freeform question. Include enough context to answer it directly. No options/multiple-choice — ask one question per call.
 
 **Interaction flow:**
-1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
-2. Child session exits (like `subagent_done`)
-3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"* plus the session id
-4. Parent resumes the child session via `subagent_message({ sessionId, message })` with the response
-5. Child picks up where it left off with the parent's guidance
+1. Child calls `ask_question({ question: "Found two migration files — use v1 or v2?" })`
+2. The child's turn ends but the **session stays open** (parked as `waiting`); the tool returns *"Question sent — stop and wait for the reply."*
+3. The parent's watcher picks up the question and steers a notification: *"Sub-agent worker-2 asks: Found two migration files — use v1 or v2?"* plus the unique subagent name (and session id as backup)
+4. Parent replies while it runs via `subagent_message({ name, message })` (or `subagent_message({ sessionId, message })` if it has since exited)
+5. The reply arrives as the subagent's next message and it continues with the parent's guidance
+
+**Parallel questions are supported.** Each subagent has its own session and its own watcher, so multiple subagents can be waiting on answers at once. Default names are deduped at spawn (`worker`, `worker-2`, …), and every notification surfaces that unique name, so each reply targets the right subagent.
 
 **Example:**
 ```typescript
 // Inside a worker subagent
-await caller_ping({
-  message: "Found two conflicting migration files — should I use v1 or v2?"
+await ask_question({
+  question: "Found two conflicting migration files — should I use v1 or v2?"
 });
-// Session exits here. Parent receives the ping, then resumes this session
-// with guidance like "Use v2, v1 is deprecated"
+// Session stays open. Parent answers with subagent_message({ name: "worker", message: "Use v2…" }),
+// which arrives as this subagent's next turn.
 ```
 
-> **Note:** `caller_ping` is only available inside subagent contexts. Calling it from a standalone pi session returns an error.
+> **Note:** `ask_question` is only available inside subagent contexts. Calling it from a standalone pi session returns an error.
+>
+> If the parent never replies, the subagent stays open indefinitely (shown as `waiting`) until the human closes its pane — mirroring interactive-agent behavior. There is no timeout.
 
 ---
 
@@ -232,7 +258,7 @@ The `tools` field is a strict allowlist. The child process is launched with exte
 | `subagent_agents` | string | Comma-separated list of agent names this agent may spawn. **Presence of this field grants the full spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the listed agents. Omit it and the agent cannot spawn at all. |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, researcher); not for interactive ones (worker). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, researcher); not for interactive ones (worker). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -260,13 +286,20 @@ session-mode: lineage-only
 
 ### `auto-exit`
 
-When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_done` call is needed.
+When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn. The agent just writes its final message and stops; there is no "done" tool to call. The last assistant message becomes the summary returned to the parent.
 
 **Behavior:**
 
 - The session closes after the agent's final message (on the `agent_end` event)
 - If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
-- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
+- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents are told to simply stop when finished, while interactive agents are told the session ends when the user exits the pane
+
+**Auto-exit is suppressed while work is still in flight.** Even an `auto-exit` agent will *not* shut down at the end of a turn when either:
+
+- it has a pending [`ask_question`](#ask_question--subagent-asks-the-orchestrator) awaiting the orchestrator's reply, or
+- it spawned **its own child subagents** (e.g. a `worker` delegating to `scout`/`researcher`) that haven't finished yet.
+
+In both cases the session parks as `waiting` instead of exiting, and resumes when the next turn lands (the reply, or a child's result steered back). This is what lets a worker write *"I'll wait for the results"* and stop without killing the session out from under its children — it stays open until the **last** child reports back, then the worker's final summary is returned to the orchestrator as usual. Child liveness is read from the spawning extension's live count, so a nested agent that never spawned anything still exits immediately as before.
 
 **When to use:**
 

@@ -1256,28 +1256,23 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "ping" | "sentinel" | "error";
+  reason: "done" | "sentinel" | "error";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
-  /** Ping data if reason is "ping" */
-  ping?: { name: string; message: string };
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
 }
 
 /**
- * Interpret an `.exit` sidecar payload (written by subagent_done / caller_ping /
- * the error path in subagent-done.ts). Centralized so both the fast and slow
- * paths in pollForExit decode the payload the same way.
+ * Interpret an `.exit` sidecar payload (written by the error path in
+ * subagent-done.ts). Centralized so both the fast and slow paths in
+ * pollForExit decode the payload the same way. Clean completions write no
+ * sidecar and are detected via the terminal sentinel instead.
+ *
+ * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
+ * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
  */
 function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "ping") {
-    return {
-      reason: "ping",
-      exitCode: 0,
-      ping: { name: data.name, message: data.message },
-    };
-  }
   if (data?.type === "error") {
     const errorMessage =
       typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
@@ -1292,8 +1287,8 @@ export const __pollForExitTest__ = { interpretExitSidecar };
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by subagent_done / caller_ping), falling back to the terminal
- * sentinel for crash detection.
+ * (written by the error path), falling back to the terminal sentinel for
+ * clean-completion and crash detection.
  */
 export async function pollForExit(
   surface: string,
@@ -1312,7 +1307,7 @@ export async function pollForExit(
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    // Fast path: check for .exit sidecar file (written by subagent_done / caller_ping)
+    // Fast path: check for .exit sidecar file (written by the error path)
     if (options.sessionFile) {
       try {
         const exitFile = `${options.sessionFile}.exit`;
