@@ -751,6 +751,43 @@ function createCmuxSplitSurface(
  *
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
+/**
+ * tmux layout applied to the subagent window to keep panes evenly sized.
+ * Switchable: "even-horizontal" (equal columns, matches Ctrl+b Alt+1),
+ * "main-vertical" (big main pane + tiled column), "tiled" (grid).
+ */
+const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
+
+let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Re-balance subagent panes so repeated splits don't leave them lopsided.
+ * tmux halves the target pane on every split and dumps freed space onto a
+ * neighbor on close, so without this panes drift to wildly uneven widths.
+ * Applies SUBAGENT_TMUX_LAYOUT to the parent pi window. tmux-only — cmux uses
+ * tabs and zellij/wezterm manage their own layouts. Debounced so a burst of
+ * parallel spawns or staggered exits collapses into a single layout call, and
+ * non-fatal: a cosmetic resize must never break spawning or watching.
+ */
+export function rebalanceSurfaces(hintPane?: string): void {
+  if (getMuxBackend() !== "tmux") return;
+  // Prefer the parent pi pane (stable; survives a closing subagent pane).
+  const target = process.env.TMUX_PANE ?? hintPane;
+  if (!target) return;
+  if (rebalanceTimer) clearTimeout(rebalanceTimer);
+  rebalanceTimer = setTimeout(() => {
+    rebalanceTimer = null;
+    try {
+      // -t <pane> resolves to that pane's window; does not change focus.
+      execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
+        encoding: "utf8",
+      });
+    } catch {
+      // Pane/window may be gone; balancing is best-effort.
+    }
+  }, 120);
+}
+
 export function createSurface(name: string): string {
   const backend = getMuxBackend();
 
@@ -843,6 +880,7 @@ export function createSurfaceSplit(
       throw new Error(`Unexpected tmux split-window output: ${pane}`);
     }
 
+    rebalanceSurfaces(pane);
     return pane;
   }
 
@@ -1202,6 +1240,7 @@ export function closeSurface(surface: string): void {
 
   if (backend === "tmux") {
     execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+    rebalanceSurfaces();
     return;
   }
 
