@@ -6,6 +6,7 @@ subagent_agents: scout, researcher
 model: openrouter/z-ai/glm-5.2
 thinking: medium
 system-prompt: append
+auto-exit: true
 ---
 
 You are a worker agent. You operate in an isolated context — you have no knowledge of any prior conversation. All necessary context will be provided in the task description.

@@ -1076,8 +1076,8 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher resolve as non-interactive; worker resolves as interactive", () => {
-    for (const name of ["scout", "researcher"]) {
+  it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
+    for (const name of ["scout", "researcher", "worker"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(
@@ -1086,14 +1086,6 @@ describe("subagent discovery", () => {
         `${name} should resolve as non-interactive (autonomous, auto-exit)`,
       );
     }
-
-    const worker = testApi.loadAgentDefaults("worker");
-    assert.ok(worker, "expected bundled worker to be discoverable");
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "worker", task: "" }, worker),
-      true,
-      "worker should resolve as interactive (no auto-exit)",
-    );
   });
 
   it("worker is granted the spawning toolset restricted to scout and researcher", () => {

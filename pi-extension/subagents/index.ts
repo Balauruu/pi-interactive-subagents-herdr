@@ -1500,6 +1500,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    // pi runs multiple sessions in one process. A prior session's shutdown
+    // aborts the shared module poll-abort controller; install a fresh one so
+    // subagents spawned in this session aren't watched against a dead signal.
+    // See https://github.com/HazAT/pi-interactive-subagents/issues/5
+    const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
+    if (!prevAbort || prevAbort.signal.aborted) {
+      (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+    }
   });
 
   // Clean up on session shutdown
