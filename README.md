@@ -182,7 +182,11 @@ subagent_message({ sessionId: "019f05b2-f1c3", message: "Now write the tests too
 
 Resuming is fire-and-forget async: the relaunched session always runs its follow-up task autonomously and its result is delivered later as a steer message, exactly like a fresh `subagent` spawn. (There is no per-call behavior knob — resume is always autonomous, matching this result-delivery model.)
 
+**Resume replays the original sandbox.** A resumed subagent is *not* relaunched as a bare `pi --session`. At spawn time the extension snapshots the agent's fully-resolved loadout — the `--tools` allowlist, backing extensions, model + thinking level, identity/system prompt, spawn whitelist, cwd, and config dir — into a `<session>.loadout.json` sidecar next to the session file. Resume reads that snapshot and reconstructs the exact same `--no-extensions` + `--tools` sandbox, so the reincarnated process gets the same restricted toolset it originally ran with instead of pi's default (all global extensions + the full toolset). The snapshot is stored, not re-derived from the agent `.md` by name, so resume stays faithful even if the agent definition was later edited, moved, or deleted.
+
 > **Guard:** a `sessionId` that maps to a still-running subagent is rejected — resuming would launch a second process mutating the same session file. Steer it by `name` instead. There is no hard-abort tool; to forcibly stop a subagent, use its pane directly.
+
+> **Refusal:** if a session has no loadout snapshot (it predates this feature, or the sidecar was deleted), resume is **refused** with a clear error rather than relaunching unrestricted. Re-run the task as a fresh subagent instead.
 
 **`subagent_message` parameters:**
 - `name` — exact display name of a running subagent to steer (mutually exclusive with `sessionId`)
@@ -338,6 +342,8 @@ name: worker
 ## Tool Access Control
 
 Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`. Only the tools named in the agent's `tools` frontmatter are exposed, and only the extensions that register those tools are loaded back in via explicit `--extension` flags. There is no global default toolset and no deny-list to maintain — an agent gets exactly what it asks for.
+
+This restriction survives **resume**: the resolved sandbox is snapshotted to a `<session>.loadout.json` sidecar at spawn and replayed verbatim when the session is later resumed via `subagent_message({ sessionId })`. A session with no snapshot is refused rather than relaunched unrestricted, so there is no path by which a resume silently escalates a sub-agent back to the full toolset + all global extensions.
 
 ### Spawns must name a known agent
 

@@ -31,10 +31,13 @@ import {
   findLastAssistantMessage,
   getNewEntries,
   getSessionId,
+  readSubagentLoadout,
   resolveSessionFileById,
   seedSubagentSessionFile,
   summarizeSessionStats,
+  writeSubagentLoadout,
   type SessionStats,
+  type SubagentLoadout,
 } from "./session.ts";
 import {
   type StatusSnapshot,
@@ -164,6 +167,40 @@ function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
+// ── Runtime tool-extension registration ─────────────────────────────────────
+// `getToolExtensionPath` otherwise only knows a closed set of tool names. Other
+// pi extensions that bundle a tool for subagents (e.g. a project-local
+// extension exposing a bespoke tool) register its name → extension-file path
+// here at load/session_start time so a child process can be launched with
+// `--no-extensions` + an explicit `-e <path>` for it. Mirrors the legacy
+// `subagents` extension's `registerToolExtension` hook.
+const EXTRA_TOOL_EXTENSIONS = new Map<string, string>();
+
+/** Register (or re-register) a custom tool's backing extension file. */
+export function registerToolExtension(name: string, extensionPath: string): void {
+  if (BUILTIN_TOOLS.has(name)) {
+    throw new Error(`Cannot register custom tool "${name}": shadows a built-in pi tool`);
+  }
+  if ((SPAWNING_TOOLS as readonly string[]).includes(name)) {
+    throw new Error(`Cannot register custom tool "${name}": shadows a spawning tool`);
+  }
+  const existing = EXTRA_TOOL_EXTENSIONS.get(name);
+  if (existing === extensionPath) return; // idempotent / reload-safe
+  if (existing !== undefined) {
+    throw new Error(
+      `Tool extension already registered for "${name}": ${existing} (refusing to overwrite with ${extensionPath})`,
+    );
+  }
+  EXTRA_TOOL_EXTENSIONS.set(name, extensionPath);
+}
+
+// Expose registration on a process-global so project-local extensions loaded
+// via jiti (separate module instances) can reach this shared map. Set at module
+// load so it's available before any `session_start` listener runs.
+(globalThis as any).__pi_interactive_subagents = {
+  registerToolExtension,
+};
+
 /**
  * Map a custom (non-built-in) tool name to the pi-extension file that
  * registers it. Used to build the child's `--extension` whitelist after
@@ -185,7 +222,12 @@ function getToolExtensionPath(tool: string): string | undefined {
     google_image_search: join(extBase, "google-image-search", "index.ts"),
     safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
   };
-  return map[tool];
+  // Prefer the built-in path, but fall back to a runtime-registered extension
+  // when that path no longer exists on disk (e.g. a built-in tool extension
+  // was disabled/removed but a project-local extension re-registered it).
+  const builtin = map[tool];
+  if (builtin && existsSync(builtin)) return builtin;
+  return EXTRA_TOOL_EXTENSIONS.get(tool);
 }
 
 /**
@@ -777,6 +819,60 @@ function buildSubagentToolAllowlist(
   return [...allow].join(",");
 }
 
+/**
+ * Apply a loadout snapshot's sandbox to a pi command's `parts` array: model,
+ * identity (system prompt), and the default-deny tool/extension restriction
+ * (`--no-extensions` + `--tools` + one `-e` per tool-backing extension).
+ *
+ * This is the single source of truth for reconstructing a subagent's sandbox,
+ * used both by the initial `launchSubagent` and by the `subagent_message`
+ * resume path so the two can never drift. Env vars (PI_SUBAGENT_AGENT /
+ * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR) and cwd are the caller's
+ * responsibility since they differ slightly between launch and resume.
+ */
+function applySandboxToParts(
+  parts: string[],
+  loadout: SubagentLoadout,
+  opts: { artifactDir: string; name: string },
+): void {
+  if (loadout.model) {
+    const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
+    parts.push("--model", shellEscape(model));
+  }
+
+  if (loadout.identity) {
+    const flag = loadout.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
+    const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const spSafeName = opts.name
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    const spPath = join(opts.artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
+    mkdirSync(dirname(spPath), { recursive: true });
+    writeFileSync(spPath, loadout.identity, "utf8");
+    parts.push(flag, shellEscape(spPath));
+  }
+
+  // Default-deny: disable global extension discovery and re-enable only the
+  // extensions backing the whitelisted tools. A null allowlist means the spawn
+  // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
+  if (loadout.toolAllowlist) {
+    parts.push("--no-extensions");
+    parts.push("--tools", shellEscape(loadout.toolAllowlist));
+
+    const extPaths = new Set<string>();
+    for (const tool of loadout.toolAllowlist.split(",")) {
+      const extPath = getToolExtensionPath(tool);
+      if (extPath && existsSync(extPath)) extPaths.add(extPath);
+    }
+    for (const extPath of extPaths) {
+      parts.push("-e", shellEscape(extPath));
+    }
+  }
+}
+
 function buildPiPromptArgs(params: {
   effectiveSkills?: string;
   taskDelivery: "direct" | "artifact";
@@ -1025,6 +1121,7 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
+  applySandboxToParts,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1216,59 +1313,46 @@ async function launchSubagent(
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
-  if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
-    parts.push("--model", shellEscape(model));
-  }
-
-  // Pass agent body as system prompt via file to avoid shell escaping issues
-  // with multiline content. Pi's --append-system-prompt and --system-prompt
-  // auto-detect file paths and read their contents.
-  if (identityInSystemPrompt && identity) {
-    const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
-    const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const spSafeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
-    mkdirSync(dirname(syspromptPath), { recursive: true });
-    writeFileSync(syspromptPath, identity, "utf8");
-    parts.push(flag, shellEscape(syspromptPath));
-  }
+  // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
+  // else the propagated global dir. Captured once so the launch env and the
+  // resume snapshot agree.
+  const resolvedAgentDir =
+    localAgentDir && existsSync(localAgentDir)
+      ? localAgentDir
+      : process.env.PI_CODING_AGENT_DIR ?? null;
 
   // Default-deny model: when an agent restricts its tools (or is granted the
   // spawning toolset), we disable global extension discovery and re-enable only
   // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
   // restriction keep their full default toolset and all global extensions.
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
-  if (toolAllowlist) {
-    parts.push("--no-extensions");
-    parts.push("--tools", shellEscape(toolAllowlist));
 
-    const extPaths = new Set<string>();
-    for (const tool of toolAllowlist.split(",")) {
-      const extPath = getToolExtensionPath(tool);
-      // Skip extensions that can't be resolved on disk so a missing optional
-      // extension never breaks the launch (the tool simply won't be available).
-      if (extPath && existsSync(extPath)) extPaths.add(extPath);
-    }
-    for (const extPath of extPaths) {
-      parts.push("-e", shellEscape(extPath));
-    }
-  }
+  // Snapshot the fully-resolved sandbox beside the session file so a later
+  // `subagent_message({ sessionId })` resume can replay the exact same
+  // restriction instead of relaunching pi with all global extensions + tools.
+  const loadout: SubagentLoadout = {
+    agent: params.agent ?? null,
+    toolAllowlist,
+    model: effectiveModel ?? null,
+    thinking: effectiveThinking ?? null,
+    systemPromptMode: systemPromptMode ?? null,
+    identity: identityInSystemPrompt ? identity : null,
+    spawnable: agentDefs?.subagentAgents ?? null,
+    autoExit: agentDefs?.autoExit ?? false,
+    cwd: effectiveCwd ?? null,
+    agentDir: resolvedAgentDir,
+  };
+  writeSubagentLoadout(subagentSessionFile, loadout);
+
+  // Apply model, identity, and the default-deny tool/extension restriction via
+  // the shared helper (same code path resume uses — they can't drift).
+  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = [];
 
-  // If the target cwd has its own .pi/agent/, use that as the config root.
-  // Otherwise propagate the current/global agent dir.
-  if (localAgentDir && existsSync(localAgentDir)) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`);
-  } else if (process.env.PI_CODING_AGENT_DIR) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
+  if (resolvedAgentDir) {
+    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
   }
 
   if (grantSpawning && agentDefs?.subagentAgents) {
@@ -2020,6 +2104,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
+        // Reconstruct the sandbox from the snapshot written at spawn time.
+        // Without it we cannot safely resume: relaunching bare would load every
+        // global extension + the full toolset. Refuse rather than escalate.
+        const loadout = readSubagentLoadout(sessionPath);
+        if (!loadout) {
+          const err =
+            `Cannot safely resume "${requestedId}": no sandbox snapshot found for this session ` +
+            `(it predates sandboxed resume, or its .loadout.json sidecar was removed). ` +
+            `Resuming would relaunch with all global extensions and the full toolset, so this is refused. ` +
+            `Re-run the task as a fresh subagent instead.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
         const resumedSessionId = getSessionId(sessionPath) ?? requestedId;
 
         // Record entry count before resuming so we can extract new messages
@@ -2040,6 +2137,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
 
+        // Replay the model, identity, and default-deny tool/extension sandbox.
+        applySandboxToParts(parts, loadout, { artifactDir, name });
+
         let resumeMsgFile: string | undefined;
         if (params.message) {
           const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -2058,10 +2158,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           parts.push(shellEscape(`@${resumeMsgFile}`));
         }
 
-        // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
+        // Build env prefix — replay the snapshot's config dir + spawn whitelist
+        // so the resumed process resolves the same agents/extensions and keeps
+        // the same nested-spawn restriction it originally ran with.
         const resumeEnvParts: string[] = [];
-        if (process.env.PI_CODING_AGENT_DIR) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
+        const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
+        if (resumeAgentDir) {
+          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
+        }
+        if (loadout.spawnable && loadout.spawnable.length > 0) {
+          resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
+        }
+        if (loadout.agent) {
+          resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
         }
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
@@ -2072,7 +2181,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        // Resume in the subagent's original cwd so its tools (safe_bash, edits)
+        // operate where they did before.
+        const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
+
+        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",

@@ -11,6 +11,10 @@ import {
   getLeafId,
   getNewEntries,
   getSessionId,
+  readSubagentLoadout,
+  writeSubagentLoadout,
+  loadoutSidecarPath,
+  type SubagentLoadout,
   resolveSessionFileById,
   findLastAssistantMessage,
   appendBranchSummary,
@@ -294,6 +298,44 @@ describe("session.ts", () => {
     it("returns null when no session matches", () => {
       writeSession(dir, "c.jsonl", "abc");
       assert.equal(resolveSessionFileById("zzz", dir), null);
+    });
+  });
+
+  describe("subagent loadout snapshot", () => {
+    const sample: SubagentLoadout = {
+      agent: "worker",
+      toolAllowlist: "read,write,edit,safe_bash,web_search,subagent,ask_question",
+      model: "openrouter/z-ai/glm-5.2",
+      thinking: "medium",
+      systemPromptMode: "append",
+      identity: "You are a worker agent.",
+      spawnable: ["scout", "researcher"],
+      autoExit: true,
+      cwd: "/work/dir",
+      agentDir: "/home/u/.pi/agent",
+    };
+
+    it("writes the sidecar next to the session file", () => {
+      const sf = join(dir, "s1.jsonl");
+      writeSubagentLoadout(sf, sample);
+      assert.equal(loadoutSidecarPath(sf), sf + ".loadout.json");
+      assert.ok(existsSync(sf + ".loadout.json"));
+    });
+
+    it("round-trips the full loadout", () => {
+      const sf = join(dir, "s2.jsonl");
+      writeSubagentLoadout(sf, sample);
+      assert.deepEqual(readSubagentLoadout(sf), sample);
+    });
+
+    it("returns null when the sidecar is absent", () => {
+      assert.equal(readSubagentLoadout(join(dir, "missing.jsonl")), null);
+    });
+
+    it("returns null when the sidecar is corrupt", () => {
+      const sf = join(dir, "s3.jsonl");
+      writeFileSync(sf + ".loadout.json", "not json{", "utf8");
+      assert.equal(readSubagentLoadout(sf), null);
     });
   });
 
@@ -1188,6 +1230,66 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  });
+
+  it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "worker",
+          toolAllowlist: "read,write,safe_bash",
+          model: "openrouter/z-ai/glm-5.2",
+          thinking: "medium",
+          systemPromptMode: "append",
+          identity: "You are a worker.",
+          spawnable: ["scout"],
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: d, name: "worker" },
+      );
+      const joined = parts.join(" ");
+      // Model with thinking suffix.
+      assert.ok(joined.includes("--model"), "expected --model");
+      assert.ok(joined.includes("openrouter/z-ai/glm-5.2:medium"), "expected model:thinking");
+      // Identity written to a file and appended.
+      assert.ok(joined.includes("--append-system-prompt"), "expected --append-system-prompt");
+      // Default-deny restriction.
+      assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
+      const toolsIdx = parts.indexOf("--tools");
+      assert.ok(toolsIdx >= 0, "expected --tools");
+      // The value is shell-escaped (single-quoted) before joining.
+      assert.ok(
+        parts[toolsIdx + 1].includes("read,write,safe_bash"),
+        "expected the tool allowlist as the --tools value",
+      );
+    });
+  });
+
+  it("applySandboxToParts omits restriction flags when the loadout was unrestricted", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: null,
+          toolAllowlist: null,
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: false,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: d, name: "fork" },
+      );
+      assert.deepEqual(parts, []);
+    });
   });
 
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
