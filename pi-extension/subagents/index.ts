@@ -28,11 +28,12 @@ import {
 } from "./cmux.ts";
 
 import {
+  countSessionEntryLines,
   findLastAssistantMessage,
   getNewEntries,
   getSessionId,
   readSubagentLoadout,
-  resolveSessionFileById,
+  resolveSessionFileByIdAsync,
   seedSubagentSessionFile,
   summarizeSessionStats,
   writeSubagentLoadout,
@@ -2083,12 +2084,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
-        // Resolve the id (or path) to a concrete session file.
+        // Resolve the id (or path) to a concrete session file. Use the async
+        // resolver so a cold index build (thousands of sessions) doesn't block
+        // the event loop and freeze the terminal UI.
         const sessionsRoot = dirname(ctx.sessionManager.getSessionDir());
         const sessionPath =
           requestedId.includes("/") || requestedId.includes("\\") || requestedId.endsWith(".jsonl")
             ? requestedId
-            : resolveSessionFileById(requestedId, sessionsRoot);
+            : await resolveSessionFileByIdAsync(requestedId, sessionsRoot);
 
         if (!sessionPath || !existsSync(sessionPath)) {
           const err = `No session found for id "${requestedId}". Use the session id returned in a completed subagent's result.`;
@@ -2119,8 +2122,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const resumedSessionId = getSessionId(sessionPath) ?? requestedId;
 
-        // Record entry count before resuming so we can extract new messages
-        const entryCountBefore = getNewEntries(sessionPath, 0).length;
+        // Record entry count before resuming so we can extract new messages.
+        // Count lines cheaply (no per-line JSON.parse) so resuming a large
+        // transcript doesn't block the UI.
+        const entryCountBefore = countSessionEntryLines(sessionPath);
 
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));

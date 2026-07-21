@@ -1,4 +1,4 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -10,11 +10,13 @@ import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
   getLeafId,
   getNewEntries,
+  countSessionEntryLines,
   getSessionId,
   readSubagentLoadout,
   writeSubagentLoadout,
   loadoutSidecarPath,
   type SubagentLoadout,
+  resetSessionIndexCache,
   resolveSessionFileById,
   findLastAssistantMessage,
   appendBranchSummary,
@@ -265,6 +267,19 @@ describe("session.ts", () => {
       const entries = getNewEntries(file, 2);
       assert.equal(entries.length, 0);
     });
+
+    it("countSessionEntryLines matches getNewEntries(0).length without parsing", () => {
+      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      assert.equal(countSessionEntryLines(file), getNewEntries(file, 0).length);
+      assert.equal(countSessionEntryLines(file), 4);
+    });
+
+    it("countSessionEntryLines ignores blank lines and returns 0 for missing files", () => {
+      const file = join(dir, "blanks.jsonl");
+      writeFileSync(file, JSON.stringify({ type: "session", id: "x" }) + "\n\n\n");
+      assert.equal(countSessionEntryLines(file), 1);
+      assert.equal(countSessionEntryLines(join(dir, "does-not-exist.jsonl")), 0);
+    });
   });
 
   describe("getSessionId / resolveSessionFileById", () => {
@@ -273,6 +288,12 @@ describe("session.ts", () => {
       writeFileSync(p, JSON.stringify({ type: "session", id, version: 3 }) + "\n");
       return p;
     }
+
+    // The resolver caches an id→file index per root; reset it so each test
+    // builds a fresh index from the current on-disk state.
+    beforeEach(() => {
+      resetSessionIndexCache();
+    });
 
     it("reads the header id from a session file", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG]);
@@ -298,6 +319,16 @@ describe("session.ts", () => {
     it("returns null when no session matches", () => {
       writeSession(dir, "c.jsonl", "abc");
       assert.equal(resolveSessionFileById("zzz", dir), null);
+    });
+
+    it("picks up newly added sessions on repeat calls without a reset", () => {
+      // Prime the index (first call builds it).
+      writeSession(dir, "first.jsonl", "id-first");
+      assert.equal(resolveSessionFileById("id-first", dir) !== null, true);
+      // Add a new session AFTER the index was built — no reset. The resolver's
+      // cheap refresh should index it.
+      const b = writeSession(dir, "second.jsonl", "id-second");
+      assert.equal(resolveSessionFileById("id-second", dir), b);
     });
   });
 

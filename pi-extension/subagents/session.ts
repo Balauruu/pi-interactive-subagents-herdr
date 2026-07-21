@@ -217,46 +217,176 @@ function readHeaderId(sessionFile: string): string | null {
  * resolution order: exact match first, then prefix match. Most recently
  * modified file wins on ties. Returns null when nothing matches.
  */
-export function resolveSessionFileById(sessionId: string, sessionsRoot: string): string | null {
-  if (!sessionId || !existsSync(sessionsRoot)) return null;
+/**
+ * In-process index of session id → session file, per sessions root.
+ *
+ * Resolving a session id naively walks every `.jsonl` under the sessions tree
+ * and reads each header. With a few thousand sessions that is thousands of
+ * synchronous open/read/stat syscalls — on the extension host's single thread
+ * that blocks the entire terminal UI for many seconds (measured ~67s on a
+ * 2010-file tree). To avoid that, we build the index once per root and cache
+ * it; subsequent lookups are O(1). The cache is validated cheaply (a directory
+ * listing plus statSync-only mtime checks) on every call, so new sessions are
+ * picked up without re-reading unchanged headers and without ever freezing the
+ * UI again.
+ */
+interface SessionIndex {
+  idToFile: Map<string, { path: string; mtime: number }>;
+  /** file path → mtime when indexed (staleness detection). */
+  files: Map<string, number>;
+  /** top-level dir signature used to detect newly added cwd dirs. */
+  topSig: string;
+}
+const sessionIndexCache = new Map<string, SessionIndex>();
 
-  const candidates: Array<{ path: string; id: string; mtime: number }> = [];
-  const walk = (dir: string) => {
-    let entries: import("node:fs").Dirent[];
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
+function topLevelSignature(root: string): string {
+  const parts: string[] = [];
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return "";
+  }
+  for (const e of entries) {
+    const full = join(root, e.name);
+    if (e.isDirectory()) {
+      let m = 0;
+      try {
+        m = statSync(full).mtimeMs;
+      } catch {
+        /* ignore */
+      }
+      parts.push(`d:${e.name}:${m}`);
+    } else if (e.isFile() && e.name.endsWith(".jsonl")) {
+      parts.push(`f:${e.name}`);
     }
-    for (const entry of entries) {
-      const full = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-        const id = readHeaderId(full);
-        if (!id) continue;
-        let mtime = 0;
-        try {
-          mtime = statSync(full).mtimeMs;
-        } catch {
-          /* ignore */
-        }
-        candidates.push({ path: full, id, mtime });
+  }
+  parts.sort();
+  return parts.join("|");
+}
+
+/** Recursively index new/changed .jsonl files under dir into idx. */
+function indexDir(dir: string, idx: SessionIndex): void {
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      indexDir(full, idx);
+    } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      let mtime = 0;
+      try {
+        mtime = statSync(full).mtimeMs;
+      } catch {
+        continue;
+      }
+      const known = idx.files.get(full);
+      if (known !== undefined && known === mtime) continue; // unchanged
+      const id = readHeaderId(full); // only read headers for new/changed files
+      idx.files.set(full, mtime);
+      if (!id) continue;
+      const prev = idx.idToFile.get(id);
+      if (!prev || mtime >= prev.mtime) {
+        idx.idToFile.set(id, { path: full, mtime });
       }
     }
-  };
-  walk(sessionsRoot);
+  }
+}
 
-  candidates.sort((a, b) => b.mtime - a.mtime);
-  const exact = candidates.find((c) => c.id === sessionId);
-  if (exact) return exact.path;
-  const prefix = candidates.find((c) => c.id.startsWith(sessionId));
-  return prefix ? prefix.path : null;
+function getSessionIndex(sessionsRoot: string): SessionIndex {
+  let idx = sessionIndexCache.get(sessionsRoot);
+  const sig = topLevelSignature(sessionsRoot);
+  if (!idx) {
+    idx = { idToFile: new Map(), files: new Map(), topSig: sig };
+    sessionIndexCache.set(sessionsRoot, idx);
+    indexDir(sessionsRoot, idx); // first build: full scan, once per process
+  } else if (idx.topSig !== sig) {
+    idx.topSig = sig;
+    indexDir(sessionsRoot, idx); // a cwd dir was added/changed: incremental rescan
+  } else {
+    indexDir(sessionsRoot, idx); // cheap: stats files, reads only new/changed headers
+  }
+  return idx;
+}
+
+export function resolveSessionFileById(sessionId: string, sessionsRoot: string): string | null {
+  if (!sessionId || !existsSync(sessionsRoot)) return null;
+  const idx = getSessionIndex(sessionsRoot);
+  return lookupSessionIndex(idx, sessionId);
+}
+
+function lookupSessionIndex(
+  idx: { idToFile: Map<string, { path: string; mtime: number }> },
+  sessionId: string,
+): string | null {
+  // Exact match first.
+  const exact = idx.idToFile.get(sessionId);
+  if (exact && existsSync(exact.path)) return exact.path;
+
+  // Prefix match: most recently modified wins (ids are unique in practice, so
+  // this is only a convenience for hand-typed short prefixes).
+  let best: { path: string; mtime: number } | null = null;
+  for (const [id, rec] of idx.idToFile) {
+    if (!id.startsWith(sessionId)) continue;
+    if (!existsSync(rec.path)) continue;
+    if (!best || rec.mtime > best.mtime) best = rec;
+  }
+  return best ? best.path : null;
+}
+
+/**
+ * Async variant used by the interactive resume path. Index building/refresh is
+ * synchronous I/O, which can take many seconds on a cold OS page cache with a
+ * few thousand sessions; running it synchronously would block the extension
+ * host's single thread and freeze the terminal UI. Deferring to a macrotask
+ * keeps the event loop responsive. The heavy work only happens on the first
+ * resolution per process (and incrementally thereafter); warm lookups are ~50ms.
+ */
+export async function resolveSessionFileByIdAsync(
+  sessionId: string,
+  sessionsRoot: string,
+): Promise<string | null> {
+  if (!sessionId || !existsSync(sessionsRoot)) return null;
+  // Let the event loop breathe (and the UI repaint) before the sync scan.
+  await new Promise<void>((r) => setImmediate(r));
+  const idx = getSessionIndex(sessionsRoot);
+  return lookupSessionIndex(idx, sessionId);
+}
+
+/** Test hook: drop the cached session index so tests start clean. */
+export function resetSessionIndexCache(): void {
+  sessionIndexCache.clear();
 }
 
 /**
  * Return entries added after `afterLine` (1-indexed count of existing entries).
  */
+/**
+ * Count the number of entry lines in a session file without parsing each line
+ * into an object. Used by the resume path, which only needs the *count* of
+ * pre-existing entries (so it can later slice out the new ones). Parsing every
+ * line of a large resumed transcript synchronously at resume time would block
+ * the UI; counting newlines is dramatically cheaper.
+ */
+export function countSessionEntryLines(sessionFile: string): number {
+  try {
+    const raw = readFileSync(sessionFile, "utf8");
+    // Count non-blank lines, mirroring getNewEntries' `.filter(line => line.trim())`
+    // but skipping the per-line JSON.parse that makes resume slow on big files.
+    let count = 0;
+    for (const line of raw.split("\n")) {
+      if (line.trim()) count++;
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
 export function getNewEntries(sessionFile: string, afterLine: number): SessionEntry[] {
   const raw = readFileSync(sessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
