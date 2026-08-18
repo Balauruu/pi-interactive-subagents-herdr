@@ -8,6 +8,7 @@ import {
   readFileSync,
   readSync,
   readdirSync,
+  renameSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -141,6 +142,75 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
   } catch {
     return null;
   }
+}
+
+// ── Name registry ────────────────────────────────────────────────────────────
+// Each spawner session (the top-level pi session, or a worker that spawns its
+// own children) gets a registry mapping a subagent's display name to the
+// session file it ran in. Names are unique per spawner session and persist on
+// disk, so `subagent_message({ name })` can steer a running subagent or resume
+// a finished one by the same handle — even across a pi restart. The registry
+// lives in the spawner's own artifact dir, which is directly addressable from
+// the spawner's session id (no sessions-tree scan, so resume stays fast).
+
+export interface NameRegistryEntry {
+  /** Absolute path to the subagent's session .jsonl file. */
+  sessionFile: string;
+  /** Canonical session header id (kept for display/lineage). */
+  sessionId: string | null;
+}
+
+export type NameRegistry = Record<string, NameRegistryEntry>;
+
+/** Path of the name registry for a given spawner session's artifact dir. */
+export function nameRegistryPath(artifactDir: string): string {
+  return join(artifactDir, "subagent-registry.json");
+}
+
+/** Read a spawner session's name registry, or {} if absent/corrupt. */
+export function readNameRegistry(artifactDir: string): NameRegistry {
+  try {
+    const p = nameRegistryPath(artifactDir);
+    if (!existsSync(p)) return {};
+    const parsed = JSON.parse(readFileSync(p, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed as NameRegistry;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Register (or overwrite) a name → session mapping for a spawner session.
+ * Writes atomically (temp file + rename) so a concurrent reader never sees a
+ * partial registry.
+ */
+export function registerName(
+  artifactDir: string,
+  name: string,
+  entry: NameRegistryEntry,
+): void {
+  try {
+    mkdirSync(artifactDir, { recursive: true });
+    const registry = readNameRegistry(artifactDir);
+    registry[name] = entry;
+    const p = nameRegistryPath(artifactDir);
+    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+    renameSync(tmp, p);
+  } catch {
+    // Best-effort: a failed registration only means resume-by-name won't find
+    // this subagent later; it never breaks the spawn itself.
+  }
+}
+
+/** Resolve a name to its registry entry within a spawner session, or null. */
+export function resolveNameInRegistry(
+  artifactDir: string,
+  name: string,
+): NameRegistryEntry | null {
+  const entry = readNameRegistry(artifactDir)[name];
+  return entry && typeof entry.sessionFile === "string" ? entry : null;
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {

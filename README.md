@@ -58,7 +58,7 @@ The value is passed straight to `tmux select-layout`, so any named tmux layout w
 | Tool               | Description                                                                                       |
 | ------------------ | ------------------------------------------------------------------------------------------------- |
 | `subagent`         | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)                   |
-| `subagent_message` | Steer a running subagent (by `name`) or resume a finished one (by `sessionId`)                    |
+| `subagent_message` | Steer a running subagent or resume a finished one — by `name` either way                          |
 | `subagents_list`   | List available agent definitions                                                                  |
 
 | Command                    | Description                          |
@@ -164,34 +164,26 @@ The schema is intentionally small: each agent has a fixed, well-defined loadout 
 
 ## Messaging a subagent
 
-`subagent_message` is the single tool for talking to a subagent after it has been spawned. It has two modes, selected by which argument you pass:
-
-**Steer a running subagent** — pass `name` to type a follow-up instruction directly into the live pane:
+`subagent_message` is the single tool for talking to a subagent after it has been spawned, and it is addressed **by name only**. Names are unique within your session and persist after a subagent finishes, so the *same* name works whether the subagent is running or finished — you never juggle two kinds of handle:
 
 ```typescript
 subagent_message({ name: "Scout", message: "Also check the auth middleware" });
 ```
 
-The message is delivered into the child's TUI editor (newlines are flattened to spaces so it fires as one turn). The child picks it up at its next turn boundary. The call returns immediately and does **not**, by itself, produce a new result — the subagent's eventual completion still arrives as a steer message. The widget moves the child to `waiting` until it resumes work.
+- **If it's still running** — the message is typed directly into the live pane (newlines flattened to spaces so it fires as one turn) and picked up at the next turn boundary. The call returns immediately and does **not**, by itself, produce a new result — the subagent's eventual completion still arrives as a steer message. The widget moves the child to `waiting` until it resumes work.
+- **If it has finished** — the message resumes that session and continues it, exactly like a fresh `subagent` spawn: fire-and-forget async, always autonomous, result delivered later as a steer message. The resumed run reclaims its original name (it *is* that subagent, continued).
 
-**Resume a finished subagent** — pass `sessionId` (returned in the completed subagent's result) to relaunch and continue that session:
-
-```typescript
-subagent_message({ sessionId: "019f05b2-f1c3", message: "Now write the tests too" });
-```
-
-Resuming is fire-and-forget async: the relaunched session always runs its follow-up task autonomously and its result is delivered later as a steer message, exactly like a fresh `subagent` spawn. (There is no per-call behavior knob — resume is always autonomous, matching this result-delivery model.)
+**Names are unique per session, persisted to disk.** Every spawn records its name → session-file mapping in a per-session registry at `artifacts/<yourSessionId>/subagent-registry.json`. Defaulted names auto-suffix against the *whole* registry (not just currently-running subagents), so a third `scout` is `scout-3` even after `scout` and `scout-2` have finished — every name stays addressable forever, including across a pi restart. A nested subagent that spawns its own children gets its own registry keyed by its own session id, so uniqueness is scoped per spawner.
 
 **Resume replays the original sandbox.** A resumed subagent is *not* relaunched as a bare `pi --session`. At spawn time the extension snapshots the agent's fully-resolved loadout — the `--tools` allowlist, backing extensions, model + thinking level, identity/system prompt, spawn whitelist, cwd, and config dir — into a `<session>.loadout.json` sidecar next to the session file. Resume reads that snapshot and reconstructs the exact same `--no-extensions` + `--tools` sandbox, so the reincarnated process gets the same restricted toolset it originally ran with instead of pi's default (all global extensions + the full toolset). The snapshot is stored, not re-derived from the agent `.md` by name, so resume stays faithful even if the agent definition was later edited, moved, or deleted.
 
-> **Guard:** a `sessionId` that maps to a still-running subagent is rejected — resuming would launch a second process mutating the same session file. Steer it by `name` instead. There is no hard-abort tool; to forcibly stop a subagent, use its pane directly.
+> **Guard:** naming a still-running subagent never spawns a second process on the same session file — it just steers the live one. There is no hard-abort tool; to forcibly stop a subagent, use its pane directly.
 
-> **Refusal:** if a session has no loadout snapshot (it predates this feature, or the sidecar was deleted), resume is **refused** with a clear error rather than relaunching unrestricted. Re-run the task as a fresh subagent instead.
+> **Refusal:** resume is refused with a clear error when the name isn't in this session's registry (the error lists the known names), when the mapped session file is gone, or when the session has no loadout snapshot (it predates sandboxed resume). Re-run the task as a fresh subagent instead.
 
 **`subagent_message` parameters:**
-- `name` — exact display name of a running subagent to steer (mutually exclusive with `sessionId`)
-- `sessionId` — id (or id prefix) of a finished session to resume (mutually exclusive with `name`)
-- `message` (required) — the instruction or next task to deliver
+- `name` (required) — exact display name of the subagent. Steers it if running, resumes its session if finished.
+- `message` (required) — the instruction or next task to deliver.
 
 ---
 
@@ -207,8 +199,8 @@ Unlike the old `caller_ping`, **the session stays open while it waits.** Auto-ex
 **Interaction flow:**
 1. Child calls `ask_question({ question: "Found two migration files — use v1 or v2?" })`
 2. The child's turn ends but the **session stays open** (parked as `waiting`); the tool returns *"Question sent — stop and wait for the reply."*
-3. The parent's watcher picks up the question and steers a notification: *"Sub-agent worker-2 asks: Found two migration files — use v1 or v2?"* plus the unique subagent name (and session id as backup)
-4. Parent replies while it runs via `subagent_message({ name, message })` (or `subagent_message({ sessionId, message })` if it has since exited)
+3. The parent's watcher picks up the question and steers a notification: *"Sub-agent worker-2 asks: Found two migration files — use v1 or v2?"* plus the unique subagent name
+4. Parent replies via `subagent_message({ name, message })` — the same name steers it while it runs or resumes it if it has since exited
 5. The reply arrives as the subagent's next message and it continues with the parent's guidance
 
 **Parallel questions are supported.** Each subagent has its own session and its own watcher, so multiple subagents can be waiting on answers at once. Default names are deduped at spawn (`worker`, `worker-2`, …), and every notification surfaces that unique name, so each reply targets the right subagent.
@@ -343,7 +335,7 @@ name: worker
 
 Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`. Only the tools named in the agent's `tools` frontmatter are exposed, and only the extensions that register those tools are loaded back in via explicit `--extension` flags. There is no global default toolset and no deny-list to maintain — an agent gets exactly what it asks for.
 
-This restriction survives **resume**: the resolved sandbox is snapshotted to a `<session>.loadout.json` sidecar at spawn and replayed verbatim when the session is later resumed via `subagent_message({ sessionId })`. A session with no snapshot is refused rather than relaunched unrestricted, so there is no path by which a resume silently escalates a sub-agent back to the full toolset + all global extensions.
+This restriction survives **resume**: the resolved sandbox is snapshotted to a `<session>.loadout.json` sidecar at spawn and replayed verbatim when the session is later resumed via `subagent_message({ name })`. A session with no snapshot is refused rather than relaunched unrestricted, so there is no path by which a resume silently escalates a sub-agent back to the full toolset + all global extensions.
 
 ### Spawns must name a known agent
 

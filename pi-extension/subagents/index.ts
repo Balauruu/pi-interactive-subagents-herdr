@@ -32,8 +32,10 @@ import {
   findLastAssistantMessage,
   getNewEntries,
   getSessionId,
+  readNameRegistry,
   readSubagentLoadout,
-  resolveSessionFileByIdAsync,
+  registerName,
+  resolveNameInRegistry,
   seedSubagentSessionFile,
   summarizeSessionStats,
   writeSubagentLoadout,
@@ -552,9 +554,9 @@ function resolveResultPresentation(
   >,
   name: string,
 ): string {
-  const sessionRef = result.sessionId
-    ? `\n\nSession id: ${result.sessionId}\nFollow up with subagent_message({ sessionId: "${result.sessionId}", message: "…" })`
-    : "";
+  // Name is the persistent handle: the same name steers a running subagent or
+  // resumes a finished one, so follow-ups always reference it.
+  const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -948,13 +950,20 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
 const reservedNames = new Set<string>();
 
 /**
- * Return `base`, or `base-2`, `base-3`, … if a running subagent already uses
- * that name (or a parallel spawn has reserved it). Keeps defaulted pane labels
- * unique so `subagent_message({ name })` can address each one unambiguously.
+ * Return `base`, or `base-2`, `base-3`, … so the result is unique within this
+ * spawner session. Considers (a) currently-running subagents, (b) names
+ * reserved by parallel in-flight spawns, and (c) every name already recorded in
+ * the spawner's persistent registry — so a defaulted name never collides with a
+ * finished subagent either. This lets `subagent_message({ name })` address any
+ * subagent of this session unambiguously, running or finished.
+ *
+ * `registryNames` is the set of names already taken in the registry (empty when
+ * there is no session file / artifact dir yet).
  */
-function uniqueRunningName(base: string): string {
+function uniqueRunningName(base: string, registryNames?: Set<string>): string {
   const taken = new Set(Array.from(runningSubagents.values()).map((r) => r.name));
   for (const reserved of reservedNames) taken.add(reserved);
+  if (registryNames) for (const n of registryNames) taken.add(n);
   if (!taken.has(base)) return base;
   let n = 2;
   while (taken.has(`${base}-${n}`)) n++;
@@ -1329,7 +1338,7 @@ async function launchSubagent(
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
 
   // Snapshot the fully-resolved sandbox beside the session file so a later
-  // `subagent_message({ sessionId })` resume can replay the exact same
+  // `subagent_message({ name })` resume can replay the exact same
   // restriction instead of relaunching pi with all global extensions + tools.
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
@@ -1493,12 +1502,10 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   } catch {}
   if (!payload?.question) return;
 
-  const name = running.name; // unique (deduped at spawn) — used to target the reply
+  const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
-  const replyHint = sessionId
-    ? `\n\nReply with subagent_message({ name: "${name}", message: "…" }) while it runs (or sessionId: "${sessionId}" after it exits). It stays open until you reply.`
-    : `\n\nReply with subagent_message({ name: "${name}", message: "…" }). It stays open until you reply.`;
+  const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
   latestPi?.sendMessage(
     {
@@ -1753,19 +1760,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Default the cosmetic pane label to the agent name when omitted,
-        // disambiguating against any running subagent already using it so
-        // subagent_message({ name }) can target each one unambiguously. Reserve
-        // the chosen name synchronously (before any await) so parallel spawns
-        // don't all pick the same default.
-        let reservedName: string | null = null;
-        if (!params.name?.trim()) {
-          params.name = uniqueRunningName(params.agent);
-          reservedName = params.name;
-          reservedNames.add(reservedName);
-        }
-
-        // Validate prerequisites
+        // Validate prerequisites (need mux + a session file to derive the
+        // artifact dir that hosts this session's name registry).
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
         }
@@ -1782,6 +1778,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        // This spawner session's artifact dir hosts its persistent name
+        // registry (artifacts/<parentSessionId>/subagent-registry.json).
+        const parentArtifactDir = getArtifactDir(
+          ctx.sessionManager.getSessionDir(),
+          ctx.sessionManager.getSessionId(),
+        );
+
+        // Default the cosmetic pane label to the agent name when omitted,
+        // disambiguating against running subagents, in-flight reservations, and
+        // every name already in the registry — so names stay unique across the
+        // whole session, running or finished. Reserve the chosen name
+        // synchronously (before any await) so parallel spawns don't collide.
+        let reservedName: string | null = null;
+        if (!params.name?.trim()) {
+          const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
+          params.name = uniqueRunningName(params.agent, registryNames);
+          reservedName = params.name;
+          reservedNames.add(reservedName);
+        }
+
         // Launch the subagent (creates pane, sends command). Release the name
         // reservation once it registers in runningSubagents (or launch fails) —
         // from then on uniqueRunningName tracks it via the running map.
@@ -1791,6 +1807,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         } finally {
           if (reservedName) reservedNames.delete(reservedName);
         }
+
+        // Persist name → session so subagent_message({ name }) can resume this
+        // subagent after it finishes (and after a pi restart). Done at launch,
+        // not completion, so the handle exists even if the parent dies mid-run.
+        registerName(parentArtifactDir, running.name, {
+          sessionFile: running.sessionFile,
+          sessionId: getSessionId(running.sessionFile),
+        });
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1987,31 +2011,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_message",
       label: "Message Subagent",
       description:
-        "Send a message to a subagent — either steer one that is still running, or resume a finished one. " +
-        "Provide exactly ONE of: `name` (the display name of a currently-running subagent, to inject a follow-up instruction into its live session) " +
-        "or `sessionId` (the id returned in a completed subagent's result, to relaunch that session and continue it). " +
-        "`message` is always required. " +
+        "Send a message to a subagent by name. Names are unique within your session and persist after a subagent finishes, " +
+        "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
+        "if it has finished, your message resumes that session and continues it. " +
+        "`name` and `message` are both required. " +
         "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
         "DO NOT poll, sleep, tail logs, or read session files to detect completion — the harness handles delivery. " +
         "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks.",
       promptSnippet:
-        "Message a subagent: steer a running one (by name) or resume a finished one (by sessionId). " +
-        "`message` is required. Steering returns immediately; resuming delivers its result later as a steer message. " +
+        "Message a subagent by name: steers it if running, resumes it if finished (same name either way). " +
+        "`name` and `message` are required. Steering returns immediately; resuming delivers its result later as a steer message. " +
         "Do not poll or fabricate results.",
       parameters: Type.Object({
-        name: Type.Optional(
-          Type.String({
-            description:
-              "Exact display name of a currently-running subagent to steer. Mutually exclusive with sessionId.",
-          }),
-        ),
-        sessionId: Type.Optional(
-          Type.String({
-            description:
-              "Session id (or id prefix) of a finished subagent to resume, as returned in its result. Mutually exclusive with name.",
-          }),
-        ),
+        name: Type.String({
+          description:
+            "Exact display name of the subagent. Steers it if it is still running; resumes its session if it has finished.",
+        }),
         message: Type.String({
           description:
             "The message to deliver: a follow-up instruction for a running subagent, or the next task for a resumed session.",
@@ -2019,10 +2035,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }),
 
       renderCall(args, theme) {
-        const target = args.name ?? args.sessionId ?? "(unknown)";
-        const verb = args.name ? " — steering" : " — resuming session";
+        const target = args.name ?? "(unknown)";
         return new Text(
-          "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", verb),
+          "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — message"),
           0,
           0,
         );
@@ -2059,11 +2074,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const hasName = !!params.name?.trim();
-        const hasSession = !!params.sessionId?.trim();
-        if (hasName === hasSession) {
-          const err =
-            "Provide exactly one of `name` (steer a running subagent) or `sessionId` (resume a finished session).";
+        const requestedName = params.name?.trim();
+        if (!requestedName) {
+          const err = "Provide the subagent's `name` to steer (if running) or resume (if finished).";
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
@@ -2072,29 +2085,40 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // ── Steer a running subagent ──
-        if (hasName) {
-          return handleSubagentSteer({ name: params.name, message: params.message });
+        // A name that matches a currently-running subagent always steers it.
+        const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
+        if (runningMatch) {
+          return handleSubagentSteer({ name: requestedName, message: params.message });
         }
 
-        // ── Resume a finished session ──
-        const requestedId = params.sessionId!.trim();
+        // ── Resume a finished session by name ──
         const message = params.message;
-        const name = "Resume";
+        const name = requestedName; // identity preservation: the resumed run reclaims its name
         const { autoExit, interactive } = resolveResumeLaunchBehavior();
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
-        // Resolve the id (or path) to a concrete session file. Use the async
-        // resolver so a cold index build (thousands of sessions) doesn't block
-        // the event loop and freeze the terminal UI.
-        const sessionsRoot = dirname(ctx.sessionManager.getSessionDir());
-        const sessionPath =
-          requestedId.includes("/") || requestedId.includes("\\") || requestedId.endsWith(".jsonl")
-            ? requestedId
-            : await resolveSessionFileByIdAsync(requestedId, sessionsRoot);
+        // Resolve the name to its session file via this session's registry.
+        const parentArtifactDir = getArtifactDir(
+          ctx.sessionManager.getSessionDir(),
+          ctx.sessionManager.getSessionId(),
+        );
+        const entry = resolveNameInRegistry(parentArtifactDir, requestedName);
+        if (!entry) {
+          const known = Object.keys(readNameRegistry(parentArtifactDir));
+          const err =
+            `No subagent named "${requestedName}" in this session. ` +
+            (known.length > 0
+              ? `Known subagents: ${known.join(", ")}.`
+              : "No subagents have been spawned in this session yet.");
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
 
+        const sessionPath = entry.sessionFile;
         if (!sessionPath || !existsSync(sessionPath)) {
-          const err = `No session found for id "${requestedId}". Use the session id returned in a completed subagent's result.`;
+          const err =
+            `Subagent "${requestedName}" is registered but its session file is gone ` +
+            `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
@@ -2102,8 +2126,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // mutating the same .jsonl corrupts it. Steer it by name instead.
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
-            const err = `Session "${requestedId}" is still running as "${r.name}". Use name: "${r.name}" to steer it instead of resuming.`;
-            return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+            const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
+            return handleSubagentSteer({ name: r.name, message: params.message });
           }
         }
 
@@ -2113,14 +2137,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const loadout = readSubagentLoadout(sessionPath);
         if (!loadout) {
           const err =
-            `Cannot safely resume "${requestedId}": no sandbox snapshot found for this session ` +
+            `Cannot safely resume "${requestedName}": no sandbox snapshot found for this session ` +
             `(it predates sandboxed resume, or its .loadout.json sidecar was removed). ` +
             `Resuming would relaunch with all global extensions and the full toolset, so this is refused. ` +
             `Re-run the task as a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        const resumedSessionId = getSessionId(sessionPath) ?? requestedId;
+        const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
 
         // Record entry count before resuming so we can extract new messages.
         // Count lines cheaply (no per-line JSON.parse) so resuming a large
@@ -2378,9 +2402,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const rawContent = typeof message.content === "string" ? message.content : "";
 
-        // Clean summary (remove session ref and leading label for display)
+        // Clean summary (remove follow-up ref and leading label for display)
         const summary = rawContent
-          .replace(/\n\nSession id: [\s\S]+$/, "")
+          .replace(/\n\nFollow up with subagent_message[\s\S]+$/, "")
           .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
           .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
           .replace(
@@ -2401,14 +2425,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               contentLines.push(line.slice(0, width - 6));
             }
           }
-          if (details.sessionId || details.sessionFile) {
+          if (details.name || details.sessionFile) {
             contentLines.push("");
-            if (details.sessionId) {
-              contentLines.push(theme.fg("dim", `Session id: ${details.sessionId}`));
+            if (details.name) {
               contentLines.push(
                 theme.fg(
                   "dim",
-                  `Follow up:  subagent_message({ sessionId: "${details.sessionId}", message: "…" })`,
+                  `Follow up:  subagent_message({ name: "${details.name}", message: "…" })`,
                 ),
               );
             }
@@ -2487,10 +2510,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (options.expanded) {
           contentLines.push("");
           contentLines.push(details.question ?? "");
-          if (details.sessionId) {
-            contentLines.push("");
-            contentLines.push(theme.fg("dim", `Session id: ${details.sessionId}`));
-          }
+          contentLines.push("");
+          contentLines.push(
+            theme.fg("dim", `Reply: subagent_message({ name: "${name}", message: "…" })`),
+          );
         } else {
           const preview = (details.question ?? "").split("\n")[0].slice(0, width - 10);
           contentLines.push(theme.fg("dim", preview));

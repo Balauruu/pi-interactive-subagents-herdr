@@ -12,7 +12,11 @@ import {
   getNewEntries,
   countSessionEntryLines,
   getSessionId,
+  readNameRegistry,
   readSubagentLoadout,
+  registerName,
+  resolveNameInRegistry,
+  nameRegistryPath,
   writeSubagentLoadout,
   loadoutSidecarPath,
   type SubagentLoadout,
@@ -367,6 +371,36 @@ describe("session.ts", () => {
       const sf = join(dir, "s3.jsonl");
       writeFileSync(sf + ".loadout.json", "not json{", "utf8");
       assert.equal(readSubagentLoadout(sf), null);
+    });
+  });
+
+  describe("subagent name registry", () => {
+    it("registers and resolves a name to its session file", () => {
+      const adir = join(dir, "art-1");
+      registerName(adir, "worker", { sessionFile: "/s/worker.jsonl", sessionId: "id-worker" });
+      const entry = resolveNameInRegistry(adir, "worker");
+      assert.deepEqual(entry, { sessionFile: "/s/worker.jsonl", sessionId: "id-worker" });
+      assert.ok(existsSync(nameRegistryPath(adir)));
+    });
+
+    it("accumulates multiple names and overwrites on re-register", () => {
+      const adir = join(dir, "art-2");
+      registerName(adir, "scout", { sessionFile: "/s/scout.jsonl", sessionId: "id-scout" });
+      registerName(adir, "scout-2", { sessionFile: "/s/scout2.jsonl", sessionId: "id-scout2" });
+      const reg = readNameRegistry(adir);
+      assert.deepEqual(Object.keys(reg).sort(), ["scout", "scout-2"]);
+      // Overwrite scout with a new session file.
+      registerName(adir, "scout", { sessionFile: "/s/scout-new.jsonl", sessionId: "id-scout-new" });
+      assert.equal(resolveNameInRegistry(adir, "scout")!.sessionFile, "/s/scout-new.jsonl");
+    });
+
+    it("returns null for unknown names and {} for a missing/corrupt registry", () => {
+      const adir = join(dir, "art-3");
+      assert.equal(resolveNameInRegistry(adir, "nope"), null);
+      assert.deepEqual(readNameRegistry(adir), {});
+      mkdirSync(adir, { recursive: true });
+      writeFileSync(nameRegistryPath(adir), "not json{", "utf8");
+      assert.deepEqual(readNameRegistry(adir), {});
     });
   });
 
@@ -1781,7 +1815,7 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers subagent_message with only name, sessionId, and required message (no autoExit knob)", () => {
+  it("registers subagent_message with name + message both required (name-only addressing)", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1791,11 +1825,17 @@ describe("tool registration", () => {
     const props = messageTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["message", "name", "sessionId"],
-      "only name/sessionId/message should remain",
+      ["message", "name"],
+      "only name/message should remain (sessionId dropped)",
     );
     assert.equal(props.message.type, "string");
-    assert.equal(messageTool.parameters.required?.includes("message"), true);
+    assert.equal(props.name.type, "string");
+    assert.deepEqual(
+      messageTool.parameters.required?.slice().sort(),
+      ["message", "name"],
+      "name and message should both be required",
+    );
+    assert.equal(props.sessionId, undefined, "sessionId should be removed");
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
 
@@ -2049,6 +2089,28 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("uniqueRunningName also avoids names already taken in the persistent registry", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const reserved = testApi.reservedNames as Set<string>;
+    runningMap.clear();
+    reserved.clear();
+
+    try {
+      // A finished subagent's name lives in the registry even though nothing is
+      // running — a fresh default must skip it so names stay unique session-wide.
+      const registryNames = new Set(["worker", "worker-2"]);
+      assert.equal(testApi.uniqueRunningName("worker", registryNames), "worker-3");
+      // A name not in the registry (or running/reserved) is unaffected.
+      assert.equal(testApi.uniqueRunningName("scout", registryNames), "scout");
+      // An empty registry behaves like before.
+      assert.equal(testApi.uniqueRunningName("worker", new Set()), "worker");
+    } finally {
+      runningMap.clear();
+      reserved.clear();
+    }
+  });
+
   it("uniqueRunningName also avoids names reserved by in-flight parallel spawns", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
@@ -2205,8 +2267,9 @@ describe("subagent interruption", () => {
 
     assert.match(presentation, /failed \(exit code 130\)/);
     assert.doesNotMatch(presentation, /interrupted/);
-    assert.match(presentation, /Session id: 019f-abc/);
-    assert.match(presentation, /subagent_message/);
+    // Follow-ups reference the name (not the session id).
+    assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
+    assert.doesNotMatch(presentation, /Session id:/);
   });
 
   it("renders a clear provider/agent error when errorMessage is set", () => {
@@ -2231,8 +2294,8 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
-    assert.match(presentation, /subagent_message/);
-    assert.match(presentation, /Session id: 019f-xyz/);
+    assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
+    assert.doesNotMatch(presentation, /Session id:/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
   });
 });
