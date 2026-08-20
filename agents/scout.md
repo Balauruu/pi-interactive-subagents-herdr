@@ -2,7 +2,7 @@
 name: scout
 description: Fast codebase recon — explores files, finds patterns, maps architecture
 tools: read, grep, find, ls
-model: openrouter/deepseek/deepseek-v4-pro
+model: openrouter/qwen/qwen3.8-2.4t-a95b
 thinking: low
 system-prompt: append
 auto-exit: true
