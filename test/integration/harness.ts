@@ -2,11 +2,11 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect available mux backends (cmux, tmux, zellij)
+ * - Detect whether tmux is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in mux surfaces
+ * - Start real pi sessions in tmux panes
  * - Poll for file creation and screen output
- * - Clean up surfaces and temp files after tests
+ * - Clean up panes and temp files after tests
  */
 import { execFileSync } from "node:child_process";
 import {
@@ -23,7 +23,7 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
-  getMuxBackend,
+  isMuxAvailable,
   createSurface,
   createSurfaceSplit,
   sendCommand,
@@ -31,14 +31,10 @@ import {
   readScreen,
   readScreenAsync,
   closeSurface,
-  sendEscape,
   shellEscape,
-  parseCmuxFocusedSnapshotFromJson,
-  parseCmuxPaneRefForSurfaceFromJson,
-  type MuxBackend,
-} from "../../pi-extension/subagents/cmux.ts";
+} from "../../pi-extension/subagents/tmux.ts";
 
-// Re-export mux primitives for tests
+// Re-export tmux primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -47,10 +43,8 @@ export {
   readScreen,
   readScreenAsync,
   closeSurface,
-  sendEscape,
   shellEscape,
 };
-export type { MuxBackend };
 
 // ── Paths ──
 
@@ -82,99 +76,42 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect which mux backends are actually available in the current environment.
- * Temporarily sets PI_SUBAGENT_MUX to probe each backend.
+ * Detect whether tmux is available in the current environment.
+ * Returns ["tmux"] or [].
  */
-export function getAvailableBackends(): MuxBackend[] {
-  const backends: MuxBackend[] = [];
-  const orig = process.env.PI_SUBAGENT_MUX;
-
-  for (const backend of ["cmux", "tmux", "zellij"] as MuxBackend[]) {
-    process.env.PI_SUBAGENT_MUX = backend;
-    try {
-      if (getMuxBackend() === backend) backends.push(backend);
-    } catch {}
-  }
-
-  if (orig === undefined) delete process.env.PI_SUBAGENT_MUX;
-  else process.env.PI_SUBAGENT_MUX = orig;
-
-  return backends;
+export function getAvailableBackends(): string[] {
+  return isMuxAvailable() ? ["tmux"] : [];
 }
 
-export function setBackend(backend: MuxBackend): string | undefined {
-  const prev = process.env.PI_SUBAGENT_MUX;
-  process.env.PI_SUBAGENT_MUX = backend;
-  return prev;
+export function focusSurface(surface: string): void {
+  execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
 }
 
-export function restoreBackend(prev: string | undefined): void {
-  if (prev === undefined) delete process.env.PI_SUBAGENT_MUX;
-  else process.env.PI_SUBAGENT_MUX = prev;
-}
-
-export function focusSurface(backend: MuxBackend, surface: string): void {
-  if (backend === "cmux") {
-    const pane = getSurfacePane(backend, surface);
-    if (pane) execFileSync("cmux", ["focus-pane", "--pane", pane], { encoding: "utf8" });
-    execFileSync("cmux", ["focus-panel", "--panel", surface], { encoding: "utf8" });
-    return;
+export function getFocusedSurface(): string | null {
+  try {
+    const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
+      encoding: "utf8",
+    });
+    const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
+    return activeLine?.split(" ")[0] ?? null;
+  } catch {
+    return null;
   }
-
-  if (backend === "tmux") {
-    execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
-    return;
-  }
-
-  throw new Error(`Focus helpers are not implemented for ${backend}`);
-}
-
-export function getFocusedSurface(backend: MuxBackend): string | null {
-  if (backend === "cmux") {
-    const info = execFileSync("cmux", ["identify", "--json"], { encoding: "utf8" });
-    return parseCmuxFocusedSnapshotFromJson(info)?.surfaceRef ?? null;
-  }
-
-  if (backend === "tmux") {
-    try {
-      const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
-        encoding: "utf8",
-      });
-      const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
-      return activeLine?.split(" ")[0] ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  throw new Error(`Focus helpers are not implemented for ${backend}`);
-}
-
-export function getSurfacePane(backend: MuxBackend, surface: string): string | null {
-  if (backend === "cmux") {
-    const info = execFileSync("cmux", ["identify", "--surface", surface], { encoding: "utf8" });
-    return parseCmuxPaneRefForSurfaceFromJson(info, surface);
-  }
-
-  if (backend === "tmux") return surface;
-
-  throw new Error(`Pane lookup is not implemented for ${backend}`);
 }
 
 export async function waitForFocusedSurface(
-  backend: MuxBackend,
   surface: string,
   timeout: number = PI_TIMEOUT,
 ): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeout) {
-    if (getFocusedSurface(backend) === surface) return;
+    if (getFocusedSurface() === surface) return;
     await sleep(200);
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused ${backend} surface ${surface}; ` +
-      `current focus is ${getFocusedSurface(backend) ?? "unknown"}`,
+    `Timeout (${timeout}ms) waiting for focused tmux pane ${surface}; ` +
+      `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }
 
@@ -183,9 +120,7 @@ export async function waitForFocusedSurface(
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
-  /** Active mux backend for this test run */
-  backend: MuxBackend;
-  /** Surfaces created during the test (cleaned up automatically) */
+  /** Panes created during the test (cleaned up automatically) */
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
@@ -195,7 +130,7 @@ export interface TestEnv {
  * Create an isolated test environment with test agent definitions.
  * The temp dir has `.pi/agents/` containing copies of all test agents.
  */
-export function createTestEnv(backend: MuxBackend): TestEnv {
+export function createTestEnv(): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
   const agentsDir = join(dir, ".pi", "agents");
   mkdirSync(agentsDir, { recursive: true });
@@ -209,7 +144,7 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
     }
   }
 
-  return { dir, backend, surfaces: [], tempFiles: [] };
+  return { dir, surfaces: [], tempFiles: [] };
 }
 
 /**

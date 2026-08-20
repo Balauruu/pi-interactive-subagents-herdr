@@ -1,15 +1,15 @@
 {
   "name": "pi-interactive-subagents",
   "version": "3.7.2",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in cmux/tmux/zellij terminals",
+  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in tmux",
   "keywords": [
     "pi-package"
   ],
   "license": "MIT",
-  "author": "HazAT",
+  "author": "Amos Blomqvist",
   "repository": {
     "type": "git",
-    "url": "https://github.com/HazAT/pi-interactive-subagents"
+    "url": "https://github.com/amosblomqvist/pi-interactive-subagents"
   },
   "type": "module",
   "scripts": {

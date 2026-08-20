@@ -22,10 +22,9 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
-  getMuxBackend,
   shellEscape,
   readScreen,
-} from "./cmux.ts";
+} from "./tmux.ts";
 
 import {
   countSessionEntryLines,
@@ -509,10 +508,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require a supported terminal multiplexer. ${muxSetupHint()}`,
+        text: `Subagents require tmux. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "mux not available" },
+    details: { error: "tmux not available" },
   };
 }
 
@@ -1007,10 +1006,9 @@ function steerSubagent(
     send(running.surface, flattened);
     return { ok: true };
   } catch (error: any) {
-    const backend = getMuxBackend() ?? "unknown";
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via ${backend}: ` +
+        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
         `${error?.message ?? String(error)}`,
     };
   }

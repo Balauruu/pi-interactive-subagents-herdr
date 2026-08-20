@@ -1,6 +1,6 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in multiplexer panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
+Async subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in tmux panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
 ## How It Works
 
@@ -27,13 +27,13 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent panes are created without stealing keyboard focus: splits target the parent pi pane by explicit id, so focus and pane creation are independent. Launch commands target child panes by id as well.
 
-### Pane layout (tmux)
+### Pane layout
 
-Under tmux, each subagent is a horizontal split off the parent pi pane. Left to itself, tmux halves the target pane on every split and dumps freed space onto a neighbor on close, so panes drift to wildly uneven widths. To prevent that, the extension automatically re-applies an even layout to the subagent window after every spawn and every exit (debounced so a burst of parallel spawns or staggered exits collapses into a single layout call). This only runs under tmux — cmux uses tabs, and zellij/wezterm manage their own layouts.
+Each subagent is a horizontal split off the parent pi pane. Left to itself, tmux halves the target pane on every split and dumps freed space onto a neighbor on close, so panes drift to wildly uneven widths. To prevent that, the extension automatically re-applies an even layout to the subagent window after every spawn and every exit (debounced so a burst of parallel spawns or staggered exits collapses into a single layout call).
 
-The layout is a single constant in `pi-extension/subagents/cmux.ts`:
+The layout is a single constant in `pi-extension/subagents/tmux.ts`:
 
 ```ts
 const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
@@ -57,7 +57,7 @@ The value is passed straight to `tmux select-layout`, so any named tmux layout w
 
 | Tool               | Description                                                                                       |
 | ------------------ | ------------------------------------------------------------------------------------------------- |
-| `subagent`         | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)                   |
+| `subagent`         | Spawn a sub-agent in a dedicated tmux pane (async — returns immediately)                         |
 | `subagent_message` | Steer a running subagent or resume a finished one — by `name` either way                          |
 | `subagents_list`   | List available agent definitions                                                                  |
 
@@ -83,7 +83,7 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 
 ```
 1. Agent calls subagent()          → returns immediately ("started")
-2. Sub-agent runs in mux pane      → widget shows live status
+2. Sub-agent runs in tmux pane      → widget shows live status
 3. User keeps chatting             → main session fully interactive
 4. Sub-agent finishes              → result steered back as a normal completion/failure
 5. Main agent processes result     → continues with new context
@@ -420,33 +420,19 @@ Every sub-agent session displays a compact tools widget showing the agent's allo
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono) — the coding agent
-- One supported multiplexer:
-  - [cmux](https://github.com/manaflow-ai/cmux)
-  - [tmux](https://github.com/tmux/tmux)
-  - [zellij](https://zellij.dev)
-  - [WezTerm](https://wezfurlong.org/wezterm/)
+- [tmux](https://github.com/tmux/tmux)
 
 ```bash
-cmux pi
-# or
 tmux new -A -s pi 'pi'
-# or
-zellij --session pi   # then run: pi
-# or
-# just run pi inside WezTerm
 ```
 
-Optional backend override:
-
-```bash
-export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
-```
+> This fork is **tmux-only**. It was forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which also supports cmux, zellij, and WezTerm — look there if you need another multiplexer.
 
 ---
 
 ## Acknowledgements
 
-The sub-agent status supervision and turn-only interruption features were inspired by [RepoPrompt](https://repoprompt.com/)'s sub-agent snapshot polling and run cancellation features.
+Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget. The sub-agent status supervision and turn-only interruption features were inspired by [RepoPrompt](https://repoprompt.com/)'s sub-agent snapshot polling and run cancellation features.
 
 ---
 
