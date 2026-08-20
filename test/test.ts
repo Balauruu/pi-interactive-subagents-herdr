@@ -1656,6 +1656,101 @@ describe("subagent-done.ts", () => {
         rmSync(dir, { recursive: true, force: true });
       }
     });
+
+    // Regression tests for the mid-run reply race: a reply steered in while the
+    // asking run is still open fires `input` but NOT `agent_start`, so the flag
+    // must be cleared on `input` or the session parks forever.
+    function setupCapturingExtension(sessionFile: string) {
+      const handlers = new Map<string, Array<(...args: any[]) => void>>();
+      const tools: any[] = [];
+      const api = {
+        on(event: string, handler: (...args: any[]) => void) {
+          if (!handlers.has(event)) handlers.set(event, []);
+          handlers.get(event)!.push(handler);
+        },
+        registerTool(t: any) { tools.push(t); },
+        registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
+        sendUserMessage() {}, sendMessage() {}, getAllTools() { return []; },
+      } as any;
+      const saved = {
+        session: process.env.PI_SUBAGENT_SESSION,
+        name: process.env.PI_SUBAGENT_NAME,
+        agent: process.env.PI_SUBAGENT_AGENT,
+        autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+      };
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+      process.env.PI_SUBAGENT_NAME = "scout-2";
+      process.env.PI_SUBAGENT_AGENT = "scout";
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      subagentDoneExtension(api);
+      const emit = (event: string, ...args: any[]) =>
+        (handlers.get(event) ?? []).forEach((h) => h(...args));
+      const restore = () => {
+        restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
+        restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
+        restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+      };
+      const ask = async () => {
+        const tool = tools.find((t) => t.name === "ask_question");
+        await tool.execute("c1", { question: "v1 or v2?" }, undefined, undefined, { shutdown() {} });
+      };
+      return { emit, ask, restore };
+    }
+
+    it("exits (does not park) when the reply arrives mid-run via input", async () => {
+      const dir = createTestDir();
+      const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
+      try {
+        emit("agent_start");
+        await ask(); // sets awaitingAnswer mid-run
+        // Reply arrives MID-RUN as a steer: input fires, no new agent_start.
+        emit("input");
+        let shutdown = false;
+        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("parks as waiting at agent_end while the reply is still pending (no input yet)", async () => {
+      const dir = createTestDir();
+      const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
+      try {
+        emit("agent_start");
+        await ask();
+        // No input yet — the orchestrator has not replied.
+        let shutdown = false;
+        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, false, "pending question with no reply must park, not exit");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("exits when the reply arrives as a new turn (agent_start also clears the flag)", async () => {
+      const dir = createTestDir();
+      const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
+      try {
+        emit("agent_start");
+        await ask();
+        let shutdown1 = false;
+        emit("agent_end", { messages: [] }, { shutdown() { shutdown1 = true; } });
+        assert.equal(shutdown1, false, "parks while waiting");
+        // Reply arrives as a fresh turn after the subagent had parked.
+        emit("input");
+        emit("agent_start");
+        let shutdown2 = false;
+        emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
+        assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });
 

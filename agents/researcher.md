@@ -2,7 +2,7 @@
 name: researcher
 description: Web researcher — searches the web and synthesizes findings
 tools: web_search, web_fetch, safe_bash
-model: openrouter/qwen/qwen3.8-max
+model: openrouter/qwen/qwen3.8-2.4t-a95b
 thinking: medium
 system-prompt: append
 auto-exit: true

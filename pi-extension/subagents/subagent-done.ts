@@ -178,9 +178,10 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
-  // Set when ask_question is called; suppresses auto-exit for that turn so the
-  // session stays open while it waits for the orchestrator's reply. Cleared at
-  // the start of the next turn (when the reply lands).
+  // Set when ask_question is called; suppresses auto-exit so the session stays
+  // open while it waits for the orchestrator's reply. Cleared when the reply
+  // lands — on `input` (covers a reply steered into the current run) and on
+  // `agent_start` (covers a reply that starts a fresh turn after parking).
   let awaitingAnswer = false;
 
   // Show widget + status bar on session start
@@ -195,6 +196,15 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", () => {
     recorder.input();
+    // A submitted message is the orchestrator's (or a human's) reply — the
+    // pending ask_question has been answered, however it was delivered. Clear
+    // here, not only on agent_start, because a reply steered in *mid-run* is
+    // absorbed into the current run (pi's `steer` behavior injects it before
+    // the next LLM call): no new agent_start fires, so without this the flag
+    // would stay set and agent_end would park the session as `waiting` even
+    // though the answer already arrived and was consumed. (The `input` event
+    // fires for mid-run steers because prompt() emits it before queueing.)
+    awaitingAnswer = false;
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
