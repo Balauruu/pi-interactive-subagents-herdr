@@ -1214,25 +1214,14 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
     await withIsolatedAgentEnv(async ({ globalDir }) => {
       const webAccessDir = join(globalDir, "npm", "node_modules", "pi-web-access");
-      const askUserQuestionDir = join(
-        globalDir,
-        "npm",
-        "node_modules",
-        "@juicesharp",
-        "rpiv-ask-user-question",
-      );
       mkdirSync(webAccessDir, { recursive: true });
-      mkdirSync(askUserQuestionDir, { recursive: true });
       const webAccessPath = join(webAccessDir, "index.ts");
-      const askUserQuestionPath = join(askUserQuestionDir, "index.ts");
       writeFileSync(webAccessPath, "");
-      writeFileSync(askUserQuestionPath, "");
 
       assert.equal(testApi.getToolExtensionPath("read"), undefined);
       assert.equal(testApi.getToolExtensionPath("bash"), undefined);
       assert.equal(testApi.getToolExtensionPath("web_search"), webAccessPath);
       assert.equal(testApi.getToolExtensionPath("fetch_content"), webAccessPath);
-      assert.equal(testApi.getToolExtensionPath("ask_user_question"), askUserQuestionPath);
       assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
       // Spawning tools are registered by this extension itself.
       assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
@@ -1251,43 +1240,15 @@ describe("subagent discovery", () => {
         "pi-web-access",
       );
       const localWebAccessDir = join(localAgentDir, "npm", "node_modules", "pi-web-access");
-      const localAskUserQuestionDir = join(
-        localAgentDir,
-        "npm",
-        "node_modules",
-        "@juicesharp",
-        "rpiv-ask-user-question",
-      );
       const globalWebAccessDir = join(globalDir, "npm", "node_modules", "pi-web-access");
-      const globalAskUserQuestionDir = join(
-        globalDir,
-        "npm",
-        "node_modules",
-        "@juicesharp",
-        "rpiv-ask-user-question",
-      );
-      for (const dir of [
-        projectWebAccessDir,
-        localWebAccessDir,
-        localAskUserQuestionDir,
-        globalWebAccessDir,
-        globalAskUserQuestionDir,
-      ]) {
+      for (const dir of [projectWebAccessDir, localWebAccessDir, globalWebAccessDir]) {
         mkdirSync(dir, { recursive: true });
       }
 
       const projectWebAccessPath = join(projectWebAccessDir, "index.ts");
       const localWebAccessPath = join(localWebAccessDir, "index.ts");
-      const localAskUserQuestionPath = join(localAskUserQuestionDir, "index.ts");
       const globalWebAccessPath = join(globalWebAccessDir, "index.ts");
-      const globalAskUserQuestionPath = join(globalAskUserQuestionDir, "index.ts");
-      for (const path of [
-        projectWebAccessPath,
-        localWebAccessPath,
-        localAskUserQuestionPath,
-        globalWebAccessPath,
-        globalAskUserQuestionPath,
-      ]) {
+      for (const path of [projectWebAccessPath, localWebAccessPath, globalWebAccessPath]) {
         writeFileSync(path, "");
       }
 
@@ -1296,7 +1257,7 @@ describe("subagent discovery", () => {
         parts,
         {
           agent: "scout",
-          toolAllowlist: "fetch_content,ask_user_question",
+          toolAllowlist: "fetch_content",
           model: null,
           thinking: null,
           systemPromptMode: null,
@@ -1314,13 +1275,9 @@ describe("subagent discovery", () => {
       for (let i = 0; i < parts.length; i++) {
         if (parts[i] === "-e") extensionPaths.push(parts[i + 1]);
       }
-      assert.deepEqual(extensionPaths, [
-        shellEscape(projectWebAccessPath),
-        shellEscape(localAskUserQuestionPath),
-      ]);
+      assert.deepEqual(extensionPaths, [shellEscape(projectWebAccessPath)]);
       assert.ok(!extensionPaths.includes(shellEscape(localWebAccessPath)));
       assert.ok(!extensionPaths.includes(shellEscape(globalWebAccessPath)));
-      assert.ok(!extensionPaths.includes(shellEscape(globalAskUserQuestionPath)));
     });
   });
 
@@ -1425,61 +1382,11 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
+  it("buildSubagentToolAllowlist preserves requested tools and adds ask_question", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,ask_question,ask_user_question",
+      "read,bash,web_search,ask_question",
     );
-  });
-
-  it("grants ask_user_question to custom restricted agents and loads its extension", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir, globalDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "custom-read-agent",
-        ["name: custom-read-agent", "tools: read"].join("\n"),
-      );
-      const packageDir = join(
-        globalDir,
-        "npm",
-        "node_modules",
-        "@juicesharp",
-        "rpiv-ask-user-question",
-      );
-      mkdirSync(packageDir, { recursive: true });
-      const packagePath = join(packageDir, "index.ts");
-      writeFileSync(packagePath, "");
-
-      const defs = testApi.loadAgentDefaults("custom-read-agent");
-      assert.ok(defs, "expected custom agent to be discoverable");
-      const allowlist = testApi.buildSubagentToolAllowlist(defs.tools);
-      assert.equal(allowlist, "read,ask_question,ask_user_question");
-
-      const parts: string[] = [];
-      testApi.applySandboxToParts(
-        parts,
-        {
-          agent: "custom-read-agent",
-          toolAllowlist: allowlist,
-          model: null,
-          thinking: null,
-          systemPromptMode: null,
-          identity: null,
-          spawnable: null,
-          autoExit: true,
-          cwd: null,
-          agentDir: globalDir,
-          globalAgentDir: globalDir,
-        },
-        { artifactDir: projectDir, name: "custom-read-agent", projectCwd: projectDir },
-      );
-
-      const extensionPaths: string[] = [];
-      for (let i = 0; i < parts.length; i++) {
-        if (parts[i] === "-e") extensionPaths.push(parts[i + 1]);
-      }
-      assert.deepEqual(extensionPaths, [shellEscape(packagePath)]);
-    });
   });
 
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {

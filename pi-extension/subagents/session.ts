@@ -82,7 +82,7 @@ export function seedSubagentSessionFile(params: {
 
 /**
  * A snapshot of everything needed to reconstruct a subagent's sandbox when its
- * session is later resumed via `subagent_message({ sessionId })`.
+ * session is later resumed via `subagent_message({ name })`.
  *
  * Written next to the session file as `<sessionFile>.loadout.json` at spawn
  * time. Resume replays this exact snapshot so the reincarnated process gets the
