@@ -869,8 +869,8 @@ const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
  *
  * Pi 0.70+ applies --tools to built-in, extension, and custom tools. If a
  * subagent definition restricts tools to e.g. "read,bash,write", the child
- * question tools would otherwise be hidden, leaving a manually resumed or
- * user-touched subagent unable to ask its orchestrator or the user.
+ * control tool would otherwise be hidden, leaving a manually resumed or
+ * user-touched subagent unable to ask its orchestrator a question.
  */
 function buildSubagentToolAllowlist(
   effectiveTools?: string,
