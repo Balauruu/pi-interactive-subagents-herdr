@@ -1,14 +1,14 @@
 /**
- * Integration tests for the tmux surface layer.
+ * Integration tests for the Herdr surface layer.
  *
- * These tests exercise real tmux operations: creating panes,
- * sending commands, reading screen output, and closing panes.
- * No LLM calls — fast and free.
+ * These tests exercise real Herdr operations: creating panes, sending commands,
+ * reading screen output, and closing panes. No LLM calls - fast and free.
  *
- * Run inside tmux:
- *   tmux new 'npm run test:integration'
+ * Run inside Herdr:
+ *   herdr
+ *   npm run test:integration
  */
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
 import {
@@ -17,9 +17,7 @@ import {
   cleanupTestEnv,
   createTrackedSurface,
   createTrackedSurfaceSplit,
-  focusSurface,
   getFocusedSurface,
-  waitForFocusedSurface,
   untrackSurface,
   sendCommand,
   sendLongCommand,
@@ -35,42 +33,49 @@ import {
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
-const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
-
 if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping tmux-surface integration tests");
-  console.log("   Run inside tmux to enable these tests.");
+  console.log("⚠️  Herdr is not available - skipping Herdr surface integration tests");
+  console.log("   Run inside Herdr to enable these tests.");
 }
 
 for (const backend of backends) {
-  describe(`tmux-surface [${backend}]`, { timeout: 60_000 }, () => {
+  describe(`Herdr surface [${backend}]`, { timeout: 60_000 }, () => {
     let env: TestEnv;
 
     before(() => {
       env = createTestEnv();
     });
 
+    afterEach(() => {
+      for (const surface of env.surfaces) {
+        try {
+          closeSurface(surface);
+        } catch {}
+      }
+      env.surfaces = [];
+    });
+
     after(() => {
       cleanupTestEnv(env);
     });
 
-    it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
-      const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
+    it("keeps focus on the parent while Herdr creates non-focused panes", async () => {
+      const initialFocus = getFocusedSurface();
+      assert.ok(initialFocus, "The test runner should have a focused Herdr pane");
+      createTrackedSurfaceSplit(env, "focus-anchor", "right");
       await sleep(1000);
-
-      focusSurface(anchor);
-      await waitForFocusedSurface(anchor, 10_000);
+      assert.equal(getFocusedSurface(), initialFocus);
 
       const childA = createTrackedSurface(env, "focus-child-a");
-      await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
-      assert.equal(getFocusedSurface(), anchor);
+      await sleep(1000);
+      assert.equal(getFocusedSurface(), initialFocus);
 
       const childB = createTrackedSurface(env, "focus-child-b");
-      await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
-      assert.equal(getFocusedSurface(), anchor);
+      await sleep(1000);
+      assert.equal(getFocusedSurface(), initialFocus);
 
-      const markerA = uniqueId();
-      const markerB = uniqueId();
+      const markerA = uniqueId().slice(0, 4);
+      const markerB = uniqueId().slice(0, 4);
       sendCommand(childA, `echo "FOCUS_A_${markerA}"`);
       sendCommand(childB, `echo "FOCUS_B_${markerB}"`);
 
@@ -78,7 +83,7 @@ for (const backend of backends) {
         waitForScreen(childA, new RegExp(`FOCUS_A_${markerA}`), 20_000, 50),
         waitForScreen(childB, new RegExp(`FOCUS_B_${markerB}`), 20_000, 50),
       ]);
-      assert.equal(getFocusedSurface(), anchor);
+      assert.equal(getFocusedSurface(), initialFocus);
     });
 
     it("creates a surface, sends a command, reads output, and closes it", async () => {
@@ -180,7 +185,7 @@ for (const backend of backends) {
       await sleep(1000);
 
       const marker = uniqueId();
-      const filePath = `/tmp/pi-tmux-test-${marker}.txt`;
+      const filePath = `/tmp/pi-herdr-test-${marker}.txt`;
 
       sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
 
