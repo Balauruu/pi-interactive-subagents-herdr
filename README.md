@@ -27,7 +27,9 @@ Herdr owns pane layout and focus. The extension submits commands atomically thro
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
-| `ask_user_question` | *(when installed globally)* Ask the user a structured question with selectable options |
+| `ask_user_question` | Ask the user a structured question with selectable options (from a separately installed extension) |
+
+`pi-web-access` provides `web_search`, `fetch_content`, `source_check`, and `get_search_content`; `@juicesharp/rpiv-ask-user-question` provides `ask_user_question`. Both are separately installed extensions. The existing `ask_question` flow remains sub-agent-to-orchestrator; `ask_user_question` is a separate user-facing tool. Restricted children disable extension discovery and explicitly load these package extensions when present in the project `.pi/npm`, configured agent `npm`, or global agent `npm` package root, searched in that order (the default global root is `~/.pi/agent/npm`). Install them in one of those roots before listing their tools.
 
 There is also a `/subagent <agent> <task>` command for spawning directly.
 
@@ -59,7 +61,7 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 
-**Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
+**Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd, and config roots — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
 
 ### ask_question
 
@@ -103,7 +105,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash`, `ask_user_question`, `video_extract`, `youtube_search`, `google_image_search`. The control tool `ask_question` is available to every sub-agent. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash`, `ask_user_question`, `video_extract`, `youtube_search`, `google_image_search`. The subagent control tool `ask_question` and the user-facing `ask_user_question` entry are added to restricted children automatically; `ask_user_question` requires its separately installed extension. Only the extensions backing the requested or automatically granted tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -135,7 +137,7 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the allowed tools are loaded back in explicitly. There is no default toolset and no deny-list — a restricted agent gets its frontmatter tools plus the automatically granted question tools. The restriction survives resume via the loadout snapshot.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 

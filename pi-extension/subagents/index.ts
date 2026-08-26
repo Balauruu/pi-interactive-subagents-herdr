@@ -222,7 +222,7 @@ function getToolExtensionPath(
   projectCwd: string | null | undefined = process.cwd(),
 ): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
-  // The four spawning tools are registered by THIS extension.
+  // The three spawning tools are registered by THIS extension.
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
   }
@@ -875,8 +875,8 @@ const SUBAGENT_CONTROL_TOOLS = ["ask_question", "ask_user_question"] as const;
  *
  * Pi 0.70+ applies --tools to built-in, extension, and custom tools. If a
  * subagent definition restricts tools to e.g. "read,bash,write", the child
- * control tools from subagent-done.ts would otherwise be hidden, leaving a
- * manually resumed or user-touched subagent unable to call ask_question.
+ * question tools would otherwise be hidden, leaving a manually resumed or
+ * user-touched subagent unable to ask its orchestrator or the user.
  */
 function buildSubagentToolAllowlist(
   effectiveTools?: string,
@@ -912,8 +912,9 @@ function buildSubagentToolAllowlist(
  * This is the single source of truth for reconstructing a subagent's sandbox,
  * used both by the initial `launchSubagent` and by the `subagent_message`
  * resume path so the two can never drift. Env vars (PI_SUBAGENT_AGENT /
- * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR) and cwd are the caller's
- * responsibility since they differ slightly between launch and resume.
+ * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR / PI_SUBAGENT_GLOBAL_AGENT_DIR) and
+ * cwd are the caller's responsibility since they differ slightly between launch
+ * and resume.
  */
 function applySandboxToParts(
   parts: string[],
@@ -1503,7 +1504,7 @@ async function launchSubagent(
   }
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
-  // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
+  // This was already computed above so session placement, config-dir environment, and cd agree.
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");

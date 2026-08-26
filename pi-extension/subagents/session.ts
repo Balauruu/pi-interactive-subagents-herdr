@@ -87,7 +87,7 @@ export function seedSubagentSessionFile(params: {
  * Written next to the session file as `<sessionFile>.loadout.json` at spawn
  * time. Resume replays this exact snapshot so the reincarnated process gets the
  * same `--no-extensions` + `--tools` restriction, model, identity, spawn
- * whitelist, cwd, and config dir it originally ran with — instead of falling
+ * whitelist, cwd, and config roots it originally ran with — instead of falling
  * back to pi's default (all global extensions + full toolset). Storing the
  * resolved loadout (rather than re-deriving from the agent `.md` by name) keeps
  * resume faithful even if the agent definition is later edited, moved, or
