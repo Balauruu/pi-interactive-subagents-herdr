@@ -87,7 +87,7 @@ export function seedSubagentSessionFile(params: {
  * Written next to the session file as `<sessionFile>.loadout.json` at spawn
  * time. Resume replays this exact snapshot so the reincarnated process gets the
  * same `--no-extensions` + `--tools` restriction, model, identity, spawn
- * whitelist, cwd, and config dir it originally ran with — instead of falling
+ * whitelist, cwd, and config roots it originally ran with — instead of falling
  * back to pi's default (all global extensions + full toolset). Storing the
  * resolved loadout (rather than re-deriving from the agent `.md` by name) keeps
  * resume faithful even if the agent definition is later edited, moved, or
@@ -112,8 +112,12 @@ export interface SubagentLoadout {
   autoExit: boolean;
   /** Working directory the subagent ran in, or null. */
   cwd: string | null;
+  /** Project cwd used to resolve project-local resources, when available. */
+  projectCwd?: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
   agentDir: string | null;
+  /** Original parent/global agent directory used for package fallback, when available. */
+  globalAgentDir?: string | null;
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */

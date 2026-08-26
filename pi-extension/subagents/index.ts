@@ -164,9 +164,15 @@ const SPAWNING_TOOLS = [
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 
-/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
+const GLOBAL_AGENT_DIR_ENV = "PI_SUBAGENT_GLOBAL_AGENT_DIR";
+
+/** Resolve the agent config directory used by this process. */
 function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+function getGlobalAgentConfigDir(): string {
+  return process.env[GLOBAL_AGENT_DIR_ENV] ?? getAgentConfigDir();
 }
 
 // ── Runtime tool-extension registration ─────────────────────────────────────
@@ -209,27 +215,94 @@ export function registerToolExtension(name: string, extensionPath: string): void
  * `--no-extensions` disables global discovery. Returns undefined for built-in
  * tools and for unknown names (which simply won't be granted).
  */
-function getToolExtensionPath(tool: string): string | undefined {
+function getToolExtensionPath(
+  tool: string,
+  agentDir: string | null | undefined = getAgentConfigDir(),
+  globalAgentDir: string | null | undefined = getGlobalAgentConfigDir(),
+  projectCwd: string | null | undefined = process.cwd(),
+): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
-  // The four spawning tools are registered by THIS extension.
+  // The three spawning tools are registered by THIS extension.
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
   }
-  const extBase = join(getAgentConfigDir(), "extensions");
-  const map: Record<string, string> = {
-    web_search: join(extBase, "web-search", "index.ts"),
-    web_fetch: join(extBase, "web-fetch", "index.ts"),
-    video_extract: join(extBase, "video-extract", "index.ts"),
-    youtube_search: join(extBase, "youtube-search", "index.ts"),
-    google_image_search: join(extBase, "google-image-search", "index.ts"),
-    safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
+
+  const safeBash = join(SUBAGENTS_DIR, "tools", "safe-bash.ts");
+  if (tool === "safe_bash" && existsSync(safeBash)) return safeBash;
+
+  const extensionRoots = [
+    projectCwd
+      ? {
+          legacyRoot: join(projectCwd, ".pi", "extensions"),
+          packageRoot: join(projectCwd, ".pi", "npm"),
+        }
+      : null,
+    agentDir
+      ? {
+          legacyRoot: join(agentDir, "extensions"),
+          packageRoot: join(agentDir, "npm"),
+        }
+      : null,
+    globalAgentDir
+      ? {
+          legacyRoot: join(globalAgentDir, "extensions"),
+          packageRoot: join(globalAgentDir, "npm"),
+        }
+      : null,
+  ].filter(
+    (root, index, roots): root is { legacyRoot: string; packageRoot: string } =>
+      root !== null &&
+      roots.findIndex(
+        (candidate) =>
+          candidate?.legacyRoot === root.legacyRoot && candidate?.packageRoot === root.packageRoot,
+      ) === index,
+  );
+
+  const legacyMap: Record<string, string> = {
+    web_search: join("web-search", "index.ts"),
+    web_fetch: join("web-fetch", "index.ts"),
+    video_extract: join("video-extract", "index.ts"),
+    youtube_search: join("youtube-search", "index.ts"),
+    google_image_search: join("google-image-search", "index.ts"),
   };
-  // Prefer the built-in path, but fall back to a runtime-registered extension
-  // when that path no longer exists on disk (e.g. a built-in tool extension
-  // was disabled/removed but a project-local extension re-registered it).
-  const builtin = map[tool];
-  if (builtin && existsSync(builtin)) return builtin;
+  const packageMap: Record<string, string> = {
+    web_search: join("node_modules", "pi-web-access", "index.ts"),
+    fetch_content: join("node_modules", "pi-web-access", "index.ts"),
+    source_check: join("node_modules", "pi-web-access", "index.ts"),
+    get_search_content: join("node_modules", "pi-web-access", "index.ts"),
+    ask_user_question: join(
+      "node_modules",
+      "@juicesharp",
+      "rpiv-ask-user-question",
+      "index.ts",
+    ),
+  };
+
+  for (const { legacyRoot, packageRoot } of extensionRoots) {
+    const legacyPath = legacyMap[tool];
+    if (legacyPath) {
+      const path = join(legacyRoot, legacyPath);
+      if (existsSync(path)) return path;
+    }
+
+    const packagePath = packageMap[tool];
+    if (packagePath) {
+      const path = join(packageRoot, packagePath);
+      if (existsSync(path)) return path;
+    }
+  }
+
   return EXTRA_TOOL_EXTENSIONS.get(tool);
+}
+
+function buildAgentDirectoryEnvParts(
+  agentDir: string | null,
+  globalAgentDir: string | null,
+): string[] {
+  const parts: string[] = [];
+  if (agentDir) parts.push(`PI_CODING_AGENT_DIR=${shellEscape(agentDir)}`);
+  if (globalAgentDir) parts.push(`${GLOBAL_AGENT_DIR_ENV}=${shellEscape(globalAgentDir)}`);
+  return parts;
 }
 
 /**
@@ -333,7 +406,12 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
-): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
+): {
+  effectiveCwd: string | null;
+  localAgentDir: string | null;
+  effectiveAgentDir: string;
+  globalAgentDir: string;
+} {
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
@@ -345,7 +423,12 @@ function resolveSubagentPaths(
   const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
   const effectiveAgentDir =
     localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
-  return { effectiveCwd, localAgentDir, effectiveAgentDir };
+  return {
+    effectiveCwd,
+    localAgentDir,
+    effectiveAgentDir,
+    globalAgentDir: getGlobalAgentConfigDir(),
+  };
 }
 
 function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
@@ -785,15 +868,15 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["ask_question", "ask_user_question"] as const;
 
 /**
  * Build the child --tools allowlist.
  *
  * Pi 0.70+ applies --tools to built-in, extension, and custom tools. If a
  * subagent definition restricts tools to e.g. "read,bash,write", the child
- * control tools from subagent-done.ts would otherwise be hidden, leaving a
- * manually resumed or user-touched subagent unable to call ask_question.
+ * question tools would otherwise be hidden, leaving a manually resumed or
+ * user-touched subagent unable to ask its orchestrator or the user.
  */
 function buildSubagentToolAllowlist(
   effectiveTools?: string,
@@ -829,13 +912,14 @@ function buildSubagentToolAllowlist(
  * This is the single source of truth for reconstructing a subagent's sandbox,
  * used both by the initial `launchSubagent` and by the `subagent_message`
  * resume path so the two can never drift. Env vars (PI_SUBAGENT_AGENT /
- * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR) and cwd are the caller's
- * responsibility since they differ slightly between launch and resume.
+ * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR / PI_SUBAGENT_GLOBAL_AGENT_DIR) and
+ * cwd are the caller's responsibility since they differ slightly between launch
+ * and resume.
  */
 function applySandboxToParts(
   parts: string[],
   loadout: SubagentLoadout,
-  opts: { artifactDir: string; name: string },
+  opts: { artifactDir: string; name: string; projectCwd?: string | null },
 ): void {
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
@@ -866,7 +950,12 @@ function applySandboxToParts(
 
     const extPaths = new Set<string>();
     for (const tool of loadout.toolAllowlist.split(",")) {
-      const extPath = getToolExtensionPath(tool);
+      const extPath = getToolExtensionPath(
+        tool,
+        loadout.agentDir ?? undefined,
+        loadout.globalAgentDir ?? undefined,
+        opts.projectCwd ?? loadout.projectCwd ?? loadout.cwd ?? undefined,
+      );
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
     for (const extPath of extPaths) {
@@ -1134,6 +1223,8 @@ export const __test__ = {
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
+  getGlobalAgentConfigDir,
+  buildAgentDirectoryEnvParts,
   resolveRunningByName,
   uniqueRunningName,
   reservedNames,
@@ -1185,7 +1276,8 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, localAgentDir, effectiveAgentDir, globalAgentDir } =
+    resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1322,7 +1414,7 @@ async function launchSubagent(
   parts.push("-e", shellEscape(subagentDonePath));
 
   // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
-  // else the propagated global dir. Captured once so the launch env and the
+  // else the propagated config dir. Captured once so the launch env and the
   // resume snapshot agree.
   const resolvedAgentDir =
     localAgentDir && existsSync(localAgentDir)
@@ -1348,20 +1440,22 @@ async function launchSubagent(
     spawnable: agentDefs?.subagentAgents ?? null,
     autoExit: agentDefs?.autoExit ?? false,
     cwd: effectiveCwd ?? null,
+    projectCwd: targetCwdForSession,
     agentDir: resolvedAgentDir,
+    globalAgentDir,
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
   // Apply model, identity, and the default-deny tool/extension restriction via
   // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+  applySandboxToParts(parts, loadout, {
+    artifactDir,
+    name: params.name,
+    projectCwd: targetCwdForSession,
+  });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
-  const envParts: string[] = [];
-
-  if (resolvedAgentDir) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
-  }
+  const envParts: string[] = buildAgentDirectoryEnvParts(resolvedAgentDir, globalAgentDir);
 
   if (grantSpawning && agentDefs?.subagentAgents) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
@@ -1410,7 +1504,7 @@ async function launchSubagent(
   }
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
-  // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
+  // This was already computed above so session placement, config-dir environment, and cd agree.
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
@@ -2188,11 +2282,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
         // so the resumed process resolves the same agents/extensions and keeps
         // the same nested-spawn restriction it originally ran with.
-        const resumeEnvParts: string[] = [];
         const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
-        if (resumeAgentDir) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
-        }
+        const resumeGlobalAgentDir = loadout.globalAgentDir ?? getGlobalAgentConfigDir();
+        const resumeEnvParts: string[] = buildAgentDirectoryEnvParts(
+          resumeAgentDir,
+          resumeGlobalAgentDir,
+        );
         if (loadout.spawnable && loadout.spawnable.length > 0) {
           resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
         }
