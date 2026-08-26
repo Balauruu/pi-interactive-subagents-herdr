@@ -1209,7 +1209,17 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+    const webAccessPath = testApi.getToolExtensionPath("web_search");
+    assert.ok(
+      webAccessPath?.endsWith("web-search/index.ts") ||
+        webAccessPath?.endsWith("pi-web-access/index.ts"),
+    );
+    assert.ok(testApi.getToolExtensionPath("fetch_content")?.endsWith("pi-web-access/index.ts"));
+    assert.ok(
+      testApi
+        .getToolExtensionPath("ask_user_question")
+        ?.endsWith("rpiv-ask-user-question/index.ts"),
+    );
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));

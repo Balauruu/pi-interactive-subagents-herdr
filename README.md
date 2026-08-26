@@ -27,6 +27,7 @@ Herdr owns pane layout and focus. The extension submits commands atomically thro
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
+| `ask_user_question` | *(when installed globally)* Ask the user a structured question with selectable options |
 
 There is also a `/subagent <agent> <task>` command for spawning directly.
 
@@ -70,9 +71,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openai-codex/gpt-5.6-luna` (max) | `read`, `grep`, `find`, `ls`, `ask_question` | Fast read-only codebase recon |
-| **researcher** | `openai-codex/gpt-5.6-luna` (max) | `web_search`, `web_fetch`, `safe_bash`, `ask_question` | Web research, synthesized into a sourced brief |
-| **worker** | `openai-codex/gpt-5.6-luna` (max) | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch`, `ask_question` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | `openai-codex/gpt-5.6-luna` (max) | `read`, `grep`, `find`, `ls`, `ask_question`, `ask_user_question` | Fast read-only codebase recon |
+| **researcher** | `openai-codex/gpt-5.6-luna` (max) | `web_search`, `fetch_content`, `safe_bash`, `ask_question`, `ask_user_question` | Web research, synthesized into a sourced brief |
+| **worker** | `openai-codex/gpt-5.6-luna` (max) | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `ask_question`, `ask_user_question` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
@@ -86,7 +87,7 @@ name: my-agent
 description: Does something specific
 model: openai-codex/gpt-5.6-luna
 thinking: max
-tools: read, edit, write, safe_bash, web_search, ask_question
+tools: read, edit, write, safe_bash, web_search, fetch_content, ask_question, ask_user_question
 session-mode: lineage-only
 auto-exit: true
 ---
@@ -102,7 +103,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. The control tool `ask_question` is available to every sub-agent. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash`, `ask_user_question`, `video_extract`, `youtube_search`, `google_image_search`. The control tool `ask_question` is available to every sub-agent. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |

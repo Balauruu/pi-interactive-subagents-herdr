@@ -209,14 +209,16 @@ export function registerToolExtension(name: string, extensionPath: string): void
  * `--no-extensions` disables global discovery. Returns undefined for built-in
  * tools and for unknown names (which simply won't be granted).
  */
-function getToolExtensionPath(tool: string): string | undefined {
+function getToolExtensionPath(tool: string, agentDir = getAgentConfigDir()): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
   // The four spawning tools are registered by THIS extension.
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
   }
-  const extBase = join(getAgentConfigDir(), "extensions");
+
+  const extBase = join(agentDir, "extensions");
   const map: Record<string, string> = {
+    // Legacy standalone tool extensions, when present.
     web_search: join(extBase, "web-search", "index.ts"),
     web_fetch: join(extBase, "web-fetch", "index.ts"),
     video_extract: join(extBase, "video-extract", "index.ts"),
@@ -224,11 +226,30 @@ function getToolExtensionPath(tool: string): string | undefined {
     google_image_search: join(extBase, "google-image-search", "index.ts"),
     safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
   };
-  // Prefer the built-in path, but fall back to a runtime-registered extension
-  // when that path no longer exists on disk (e.g. a built-in tool extension
-  // was disabled/removed but a project-local extension re-registered it).
+  // Global packages register several tools from one extension file. These
+  // paths are explicit because --no-extensions prevents package discovery in
+  // the child process.
+  const packageMap: Record<string, string> = {
+    web_search: join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
+    fetch_content: join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
+    source_check: join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
+    get_search_content: join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
+    ask_user_question: join(
+      agentDir,
+      "npm",
+      "node_modules",
+      "@juicesharp",
+      "rpiv-ask-user-question",
+      "index.ts",
+    ),
+  };
+
+  // Prefer the built-in/legacy path, then installed global packages, and
+  // finally a runtime-registered extension when a path was reconfigured.
   const builtin = map[tool];
   if (builtin && existsSync(builtin)) return builtin;
+  const packagePath = packageMap[tool];
+  if (packagePath && existsSync(packagePath)) return packagePath;
   return EXTRA_TOOL_EXTENSIONS.get(tool);
 }
 
@@ -866,7 +887,7 @@ function applySandboxToParts(
 
     const extPaths = new Set<string>();
     for (const tool of loadout.toolAllowlist.split(",")) {
-      const extPath = getToolExtensionPath(tool);
+      const extPath = getToolExtensionPath(tool, loadout.agentDir ?? undefined);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
     for (const extPath of extPaths) {
