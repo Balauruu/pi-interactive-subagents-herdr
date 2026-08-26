@@ -6,7 +6,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own Herdr pane, a right split off the parent pi pane that does not steal keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own Herdr pane without stealing keyboard focus. The first three agent panes form columns to the right of the parent Pi pane; additional agents are distributed vertically across those columns. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Herdr owns pane layout and focus. The extension submits commands atomically through Herdr and reads the pane's detected terminal output. Right-hand subagent panes are rebalanced into equal columns after each spawn or cleanup. If the terminal is too narrow for equal columns, the main Pi pane keeps the larger share and the remaining space is divided between subagents. Set `PI_SUBAGENT_MIN_PANE_WIDTH` to change the width threshold; it defaults to `24` columns.
+Herdr owns pane layout and focus. The extension submits commands atomically through Herdr and reads the pane's detected terminal output. Up to three right-hand agent columns are rebalanced after each spawn or cleanup. Additional agents split downward from the shortest column. If the terminal is too narrow for equal columns, the main Pi pane keeps the larger share and the remaining space is divided between agent columns. Set `PI_SUBAGENT_MIN_PANE_WIDTH` to change the width threshold; it defaults to `24` columns.
 
 ## Tools
 

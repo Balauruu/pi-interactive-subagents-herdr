@@ -30,7 +30,11 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/herdr.ts";
+import {
+  shellEscape,
+  __pollForExitTest__,
+  __surfaceLayoutTest__,
+} from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -56,7 +60,6 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/herdr.ts";
 
 // --- Helpers ---
 
@@ -2856,6 +2859,35 @@ describe("subagent display helpers", () => {
 });
 
 describe("herdr.ts", () => {
+  describe("surface placement", () => {
+    it("uses three agent columns, then fills the shortest columns vertically", () => {
+      const { chooseSurfacePlacement, maxHorizontalAgentColumns } = __surfaceLayoutTest__;
+      const columns: string[][] = [];
+
+      for (let index = 0; index < maxHorizontalAgentColumns; index++) {
+        assert.deepEqual(chooseSurfacePlacement("main", columns), {
+          direction: "right",
+          source: "main",
+          columnIndex: index,
+        });
+        columns.push([`agent-${index + 1}`]);
+      }
+
+      assert.deepEqual(chooseSurfacePlacement("main", columns), {
+        direction: "down",
+        source: "agent-1",
+        columnIndex: 0,
+      });
+      columns[0]!.push(`agent-${maxHorizontalAgentColumns + 1}`);
+
+      assert.deepEqual(chooseSurfacePlacement("main", columns), {
+        direction: "down",
+        source: "agent-2",
+        columnIndex: 1,
+      });
+    });
+  });
+
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
