@@ -156,6 +156,7 @@ async function withIsolatedAgentEnv(
   const root = createTestDir();
   const previousCwd = process.cwd();
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousGlobalAgentDir = process.env.PI_SUBAGENT_GLOBAL_AGENT_DIR;
   const projectDir = join(root, "project");
   const projectAgentsDir = join(projectDir, ".pi", "agents");
   const globalDir = join(root, "global");
@@ -165,12 +166,14 @@ async function withIsolatedAgentEnv(
   mkdirSync(globalAgentsDir, { recursive: true });
   process.chdir(projectDir);
   process.env.PI_CODING_AGENT_DIR = globalDir;
+  delete process.env.PI_SUBAGENT_GLOBAL_AGENT_DIR;
 
   try {
     await fn({ projectDir, projectAgentsDir, globalDir, globalAgentsDir });
   } finally {
     process.chdir(previousCwd);
     restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+    restoreEnvVar("PI_SUBAGENT_GLOBAL_AGENT_DIR", previousGlobalAgentDir);
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -335,6 +338,7 @@ describe("session.ts", () => {
       autoExit: true,
       cwd: "/work/dir",
       agentDir: "/home/u/.pi/agent",
+      globalAgentDir: "/home/u/.pi/agent",
     };
 
     it("writes the sidecar next to the session file", () => {
@@ -1234,9 +1238,10 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("applySandboxToParts prefers local packages and falls back to global packages", async () => {
+  it("applySandboxToParts keeps local packages and falls back to the preserved global root", async () => {
     await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
       const localAgentDir = join(projectDir, ".pi", "agent");
+      process.env.PI_CODING_AGENT_DIR = localAgentDir;
       const localAskUserQuestionDir = join(
         localAgentDir,
         "npm",
@@ -1277,6 +1282,7 @@ describe("subagent discovery", () => {
           autoExit: true,
           cwd: null,
           agentDir: localAgentDir,
+          globalAgentDir: globalDir,
         },
         { artifactDir: projectDir, name: "scout" },
       );
@@ -1290,6 +1296,39 @@ describe("subagent discovery", () => {
         shellEscape(localAskUserQuestionPath),
       ]);
       assert.ok(!extensionPaths.includes(shellEscape(globalAskUserQuestionPath)));
+    });
+  });
+
+  it("propagates both config roots for nested launches and resumes", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      const localAgentDir = join(projectDir, ".pi", "agent");
+      const envParts = testApi.buildAgentDirectoryEnvParts(localAgentDir, globalDir);
+      assert.deepEqual(envParts, [
+        `PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`,
+        `PI_SUBAGENT_GLOBAL_AGENT_DIR=${shellEscape(globalDir)}`,
+      ]);
+
+      process.env.PI_CODING_AGENT_DIR = localAgentDir;
+      process.env.PI_SUBAGENT_GLOBAL_AGENT_DIR = globalDir;
+      assert.equal(testApi.getGlobalAgentConfigDir(), globalDir);
+    });
+  });
+
+  it("keeps legacy extensions local-first across both config roots", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      const localAgentDir = join(projectDir, ".pi", "agent");
+      const localLegacyDir = join(localAgentDir, "extensions", "web-search");
+      const globalLegacyDir = join(globalDir, "extensions", "web-search");
+      mkdirSync(localLegacyDir, { recursive: true });
+      mkdirSync(globalLegacyDir, { recursive: true });
+      const localLegacyPath = join(localLegacyDir, "index.ts");
+      writeFileSync(localLegacyPath, "");
+      writeFileSync(join(globalLegacyDir, "index.ts"), "");
+
+      assert.equal(
+        testApi.getToolExtensionPath("web_search", localAgentDir, globalDir),
+        localLegacyPath,
+      );
     });
   });
 

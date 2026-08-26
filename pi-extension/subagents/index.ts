@@ -164,9 +164,15 @@ const SPAWNING_TOOLS = [
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 
-/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
+const GLOBAL_AGENT_DIR_ENV = "PI_SUBAGENT_GLOBAL_AGENT_DIR";
+
+/** Resolve the agent config directory used by this process. */
 function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+function getGlobalAgentConfigDir(): string {
+  return process.env[GLOBAL_AGENT_DIR_ENV] ?? getAgentConfigDir();
 }
 
 // ── Runtime tool-extension registration ─────────────────────────────────────
@@ -209,40 +215,42 @@ export function registerToolExtension(name: string, extensionPath: string): void
  * `--no-extensions` disables global discovery. Returns undefined for built-in
  * tools and for unknown names (which simply won't be granted).
  */
-function getToolExtensionPath(tool: string, agentDir = getAgentConfigDir()): string | undefined {
+function getToolExtensionPath(
+  tool: string,
+  agentDir: string | null | undefined = getAgentConfigDir(),
+  globalAgentDir: string | null | undefined = getGlobalAgentConfigDir(),
+): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
   // The four spawning tools are registered by THIS extension.
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
   }
 
-  const extBase = join(agentDir, "extensions");
-  const map: Record<string, string> = {
-    // Legacy standalone tool extensions, when present.
-    web_search: join(extBase, "web-search", "index.ts"),
-    web_fetch: join(extBase, "web-fetch", "index.ts"),
-    video_extract: join(extBase, "video-extract", "index.ts"),
-    youtube_search: join(extBase, "youtube-search", "index.ts"),
-    google_image_search: join(extBase, "google-image-search", "index.ts"),
-    safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
-  };
-  // Global packages register several tools from one extension file. These
-  // paths are explicit because --no-extensions prevents package discovery in
-  // the child process.
-  const builtin = map[tool];
-  if (builtin && existsSync(builtin)) return builtin;
+  const safeBash = join(SUBAGENTS_DIR, "tools", "safe-bash.ts");
+  if (tool === "safe_bash" && existsSync(safeBash)) return safeBash;
 
-  const packageRoots = [agentDir, getAgentConfigDir()].filter(
-    (root, index, roots) => roots.indexOf(root) === index,
+  const extensionRoots = [agentDir, globalAgentDir].filter(
+    (root, index, roots): root is string => Boolean(root) && roots.indexOf(root) === index,
   );
-  for (const packageRoot of packageRoots) {
+  for (const extensionRoot of extensionRoots) {
+    const extBase = join(extensionRoot, "extensions");
+    const legacyMap: Record<string, string> = {
+      web_search: join(extBase, "web-search", "index.ts"),
+      web_fetch: join(extBase, "web-fetch", "index.ts"),
+      video_extract: join(extBase, "video-extract", "index.ts"),
+      youtube_search: join(extBase, "youtube-search", "index.ts"),
+      google_image_search: join(extBase, "google-image-search", "index.ts"),
+    };
+    const legacy = legacyMap[tool];
+    if (legacy && existsSync(legacy)) return legacy;
+
     const packageMap: Record<string, string> = {
-      web_search: join(packageRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
-      fetch_content: join(packageRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
-      source_check: join(packageRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
-      get_search_content: join(packageRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
+      web_search: join(extensionRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
+      fetch_content: join(extensionRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
+      source_check: join(extensionRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
+      get_search_content: join(extensionRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
       ask_user_question: join(
-        packageRoot,
+        extensionRoot,
         "npm",
         "node_modules",
         "@juicesharp",
@@ -255,6 +263,16 @@ function getToolExtensionPath(tool: string, agentDir = getAgentConfigDir()): str
   }
 
   return EXTRA_TOOL_EXTENSIONS.get(tool);
+}
+
+function buildAgentDirectoryEnvParts(
+  agentDir: string | null,
+  globalAgentDir: string | null,
+): string[] {
+  const parts: string[] = [];
+  if (agentDir) parts.push(`PI_CODING_AGENT_DIR=${shellEscape(agentDir)}`);
+  if (globalAgentDir) parts.push(`${GLOBAL_AGENT_DIR_ENV}=${shellEscape(globalAgentDir)}`);
+  return parts;
 }
 
 /**
@@ -358,7 +376,12 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
-): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
+): {
+  effectiveCwd: string | null;
+  localAgentDir: string | null;
+  effectiveAgentDir: string;
+  globalAgentDir: string;
+} {
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
@@ -370,7 +393,12 @@ function resolveSubagentPaths(
   const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
   const effectiveAgentDir =
     localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
-  return { effectiveCwd, localAgentDir, effectiveAgentDir };
+  return {
+    effectiveCwd,
+    localAgentDir,
+    effectiveAgentDir,
+    globalAgentDir: getGlobalAgentConfigDir(),
+  };
 }
 
 function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
@@ -891,7 +919,11 @@ function applySandboxToParts(
 
     const extPaths = new Set<string>();
     for (const tool of loadout.toolAllowlist.split(",")) {
-      const extPath = getToolExtensionPath(tool, loadout.agentDir ?? undefined);
+      const extPath = getToolExtensionPath(
+        tool,
+        loadout.agentDir ?? undefined,
+        loadout.globalAgentDir ?? undefined,
+      );
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
     for (const extPath of extPaths) {
@@ -1159,6 +1191,8 @@ export const __test__ = {
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
+  getGlobalAgentConfigDir,
+  buildAgentDirectoryEnvParts,
   resolveRunningByName,
   uniqueRunningName,
   reservedNames,
@@ -1210,7 +1244,8 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, localAgentDir, effectiveAgentDir, globalAgentDir } =
+    resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1347,7 +1382,7 @@ async function launchSubagent(
   parts.push("-e", shellEscape(subagentDonePath));
 
   // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
-  // else the propagated global dir. Captured once so the launch env and the
+  // else the propagated config dir. Captured once so the launch env and the
   // resume snapshot agree.
   const resolvedAgentDir =
     localAgentDir && existsSync(localAgentDir)
@@ -1374,6 +1409,7 @@ async function launchSubagent(
     autoExit: agentDefs?.autoExit ?? false,
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
+    globalAgentDir,
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
@@ -1382,11 +1418,7 @@ async function launchSubagent(
   applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
-  const envParts: string[] = [];
-
-  if (resolvedAgentDir) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
-  }
+  const envParts: string[] = buildAgentDirectoryEnvParts(resolvedAgentDir, globalAgentDir);
 
   if (grantSpawning && agentDefs?.subagentAgents) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
@@ -2213,11 +2245,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
         // so the resumed process resolves the same agents/extensions and keeps
         // the same nested-spawn restriction it originally ran with.
-        const resumeEnvParts: string[] = [];
         const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
-        if (resumeAgentDir) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
-        }
+        const resumeGlobalAgentDir = loadout.globalAgentDir ?? getGlobalAgentConfigDir();
+        const resumeEnvParts: string[] = buildAgentDirectoryEnvParts(
+          resumeAgentDir,
+          resumeGlobalAgentDir,
+        );
         if (loadout.spawnable && loadout.spawnable.length > 0) {
           resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
         }

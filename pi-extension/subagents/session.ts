@@ -114,6 +114,8 @@ export interface SubagentLoadout {
   cwd: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
   agentDir: string | null;
+  /** Original parent/global agent directory used for package fallback, when available. */
+  globalAgentDir?: string | null;
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */
