@@ -868,7 +868,7 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["ask_question", "ask_user_question"] as const;
 
 /**
  * Build the child --tools allowlist.

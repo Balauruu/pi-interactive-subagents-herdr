@@ -1428,8 +1428,58 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,ask_question",
+      "read,bash,web_search,ask_question,ask_user_question",
     );
+  });
+
+  it("grants ask_user_question to custom restricted agents and loads its extension", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir, globalDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "custom-read-agent",
+        ["name: custom-read-agent", "tools: read"].join("\n"),
+      );
+      const packageDir = join(
+        globalDir,
+        "npm",
+        "node_modules",
+        "@juicesharp",
+        "rpiv-ask-user-question",
+      );
+      mkdirSync(packageDir, { recursive: true });
+      const packagePath = join(packageDir, "index.ts");
+      writeFileSync(packagePath, "");
+
+      const defs = testApi.loadAgentDefaults("custom-read-agent");
+      assert.ok(defs, "expected custom agent to be discoverable");
+      const allowlist = testApi.buildSubagentToolAllowlist(defs.tools);
+      assert.equal(allowlist, "read,ask_question,ask_user_question");
+
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "custom-read-agent",
+          toolAllowlist: allowlist,
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: globalDir,
+          globalAgentDir: globalDir,
+        },
+        { artifactDir: projectDir, name: "custom-read-agent", projectCwd: projectDir },
+      );
+
+      const extensionPaths: string[] = [];
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i] === "-e") extensionPaths.push(parts[i + 1]);
+      }
+      assert.deepEqual(extensionPaths, [shellEscape(packagePath)]);
+    });
   });
 
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
