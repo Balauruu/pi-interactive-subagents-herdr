@@ -1206,23 +1206,91 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    const webAccessPath = testApi.getToolExtensionPath("web_search");
-    assert.ok(
-      webAccessPath?.endsWith("web-search/index.ts") ||
-        webAccessPath?.endsWith("pi-web-access/index.ts"),
-    );
-    assert.ok(testApi.getToolExtensionPath("fetch_content")?.endsWith("pi-web-access/index.ts"));
-    assert.ok(
-      testApi
-        .getToolExtensionPath("ask_user_question")
-        ?.endsWith("rpiv-ask-user-question/index.ts"),
-    );
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+  it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const webAccessDir = join(globalDir, "npm", "node_modules", "pi-web-access");
+      const askUserQuestionDir = join(
+        globalDir,
+        "npm",
+        "node_modules",
+        "@juicesharp",
+        "rpiv-ask-user-question",
+      );
+      mkdirSync(webAccessDir, { recursive: true });
+      mkdirSync(askUserQuestionDir, { recursive: true });
+      const webAccessPath = join(webAccessDir, "index.ts");
+      const askUserQuestionPath = join(askUserQuestionDir, "index.ts");
+      writeFileSync(webAccessPath, "");
+      writeFileSync(askUserQuestionPath, "");
+
+      assert.equal(testApi.getToolExtensionPath("read"), undefined);
+      assert.equal(testApi.getToolExtensionPath("bash"), undefined);
+      assert.equal(testApi.getToolExtensionPath("web_search"), webAccessPath);
+      assert.equal(testApi.getToolExtensionPath("fetch_content"), webAccessPath);
+      assert.equal(testApi.getToolExtensionPath("ask_user_question"), askUserQuestionPath);
+      assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+      // Spawning tools are registered by this extension itself.
+      assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    });
+  });
+
+  it("applySandboxToParts prefers local packages and falls back to global packages", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      const localAgentDir = join(projectDir, ".pi", "agent");
+      const localAskUserQuestionDir = join(
+        localAgentDir,
+        "npm",
+        "node_modules",
+        "@juicesharp",
+        "rpiv-ask-user-question",
+      );
+      const globalWebAccessDir = join(globalDir, "npm", "node_modules", "pi-web-access");
+      const globalAskUserQuestionDir = join(
+        globalDir,
+        "npm",
+        "node_modules",
+        "@juicesharp",
+        "rpiv-ask-user-question",
+      );
+      mkdirSync(localAskUserQuestionDir, { recursive: true });
+      mkdirSync(globalWebAccessDir, { recursive: true });
+      mkdirSync(globalAskUserQuestionDir, { recursive: true });
+
+      const localAskUserQuestionPath = join(localAskUserQuestionDir, "index.ts");
+      const globalWebAccessPath = join(globalWebAccessDir, "index.ts");
+      const globalAskUserQuestionPath = join(globalAskUserQuestionDir, "index.ts");
+      writeFileSync(localAskUserQuestionPath, "");
+      writeFileSync(globalWebAccessPath, "");
+      writeFileSync(globalAskUserQuestionPath, "");
+
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "scout",
+          toolAllowlist: "fetch_content,ask_user_question",
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: localAgentDir,
+        },
+        { artifactDir: projectDir, name: "scout" },
+      );
+
+      const extensionPaths: string[] = [];
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i] === "-e") extensionPaths.push(parts[i + 1]);
+      }
+      assert.deepEqual(extensionPaths, [
+        shellEscape(globalWebAccessPath),
+        shellEscape(localAskUserQuestionPath),
+      ]);
+      assert.ok(!extensionPaths.includes(shellEscape(globalAskUserQuestionPath)));
+    });
   });
 
   it("ignores invalid session-mode values", async () => {

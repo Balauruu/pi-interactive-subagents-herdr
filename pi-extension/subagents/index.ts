@@ -229,27 +229,31 @@ function getToolExtensionPath(tool: string, agentDir = getAgentConfigDir()): str
   // Global packages register several tools from one extension file. These
   // paths are explicit because --no-extensions prevents package discovery in
   // the child process.
-  const packageMap: Record<string, string> = {
-    web_search: join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
-    fetch_content: join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
-    source_check: join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
-    get_search_content: join(agentDir, "npm", "node_modules", "pi-web-access", "index.ts"),
-    ask_user_question: join(
-      agentDir,
-      "npm",
-      "node_modules",
-      "@juicesharp",
-      "rpiv-ask-user-question",
-      "index.ts",
-    ),
-  };
-
-  // Prefer the built-in/legacy path, then installed global packages, and
-  // finally a runtime-registered extension when a path was reconfigured.
   const builtin = map[tool];
   if (builtin && existsSync(builtin)) return builtin;
-  const packagePath = packageMap[tool];
-  if (packagePath && existsSync(packagePath)) return packagePath;
+
+  const packageRoots = [agentDir, getAgentConfigDir()].filter(
+    (root, index, roots) => roots.indexOf(root) === index,
+  );
+  for (const packageRoot of packageRoots) {
+    const packageMap: Record<string, string> = {
+      web_search: join(packageRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
+      fetch_content: join(packageRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
+      source_check: join(packageRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
+      get_search_content: join(packageRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
+      ask_user_question: join(
+        packageRoot,
+        "npm",
+        "node_modules",
+        "@juicesharp",
+        "rpiv-ask-user-question",
+        "index.ts",
+      ),
+    };
+    const packagePath = packageMap[tool];
+    if (packagePath && existsSync(packagePath)) return packagePath;
+  }
+
   return EXTRA_TOOL_EXTENSIONS.get(tool);
 }
 
