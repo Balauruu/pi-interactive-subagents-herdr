@@ -10,6 +10,7 @@
  */
 import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { unlinkSync } from "node:fs";
 import {
   getAvailableBackends,
@@ -84,6 +85,30 @@ for (const backend of backends) {
         waitForScreen(childB, new RegExp(`FOCUS_B_${markerB}`), 20_000, 50),
       ]);
       assert.equal(getFocusedSurface(), initialFocus);
+    });
+
+    it("balances right-hand panes into equal columns", () => {
+      const parent = getFocusedSurface();
+      assert.ok(parent, "The test runner should have a focused Herdr pane");
+      const surfaces = [
+        createTrackedSurface(env, "balance-1"),
+        createTrackedSurface(env, "balance-2"),
+        createTrackedSurface(env, "balance-3"),
+      ];
+
+      const response = JSON.parse(
+        execFileSync("herdr", ["pane", "layout", "--pane", parent], { encoding: "utf8" }),
+      );
+      const layout = response.result.layout;
+      const widths = [parent, ...surfaces].map(
+        (pane) => layout.panes.find((entry: any) => entry.pane_id === pane)?.rect.width,
+      );
+
+      assert.ok(widths.every((width) => typeof width === "number"));
+      assert.ok(
+        widths.every((width) => width === widths[0]),
+        `Expected equal pane widths, got ${widths.join(", ")}`,
+      );
     });
 
     it("creates a surface, sends a command, reads output, and closes it", async () => {

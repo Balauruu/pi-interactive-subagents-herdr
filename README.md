@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Herdr owns pane layout and focus. The extension submits commands atomically through Herdr and reads the pane's detected terminal output.
+Herdr owns pane layout and focus. The extension submits commands atomically through Herdr and reads the pane's detected terminal output. Right-hand subagent panes are rebalanced into equal columns after each spawn or cleanup. If the terminal is too narrow for equal columns, the main Pi pane keeps the larger share and the remaining space is divided between subagents. Set `PI_SUBAGENT_MIN_PANE_WIDTH` to change the width threshold; it defaults to `24` columns.
 
 ## Tools
 

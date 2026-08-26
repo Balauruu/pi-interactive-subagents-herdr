@@ -67,6 +67,129 @@ export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
+// ── Surface layout ──
+
+interface PaneLayout {
+  area: { width: number };
+  panes: Array<{ pane_id: string; rect: { width: number } }>;
+  splits: Array<{ ratio: number }>;
+}
+
+/**
+ * Herdr's default split behavior creates a nested right-hand tree. Repeatedly
+ * splitting the parent therefore makes the panes shrink geometrically. Keep
+ * the panes created by this extension on a left spine and rebalance its split
+ * ratios after every create/close so the columns stay equal when there is
+ * enough room. If equal columns would be too narrow, give the parent pane a
+ * larger share and divide the remaining space between the subagents.
+ */
+const MIN_BALANCED_PANE_WIDTH = Math.max(
+  1,
+  Number(process.env.PI_SUBAGENT_MIN_PANE_WIDTH ?? "24"),
+);
+const MAX_RESIZE_STEP = 0.05;
+let balancedParent: string | null = null;
+const balancedSurfaces: string[] = [];
+
+function readPaneLayout(surface: string): PaneLayout | null {
+  try {
+    const response = runHerdrJson<{ result?: { layout?: PaneLayout } }>(
+      ["pane", "layout", "--pane", surface],
+      "pane layout",
+    );
+    return response.result?.layout ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function resizeSplit(
+  pane: string,
+  direction: "left" | "right",
+  amount: number,
+): boolean {
+  if (!Number.isFinite(amount) || amount <= 0.001) return false;
+  try {
+    const response = runHerdrJson<{
+      result?: { resize?: { changed?: boolean } };
+    }>(
+      [
+        "pane",
+        "resize",
+        "--pane",
+        pane,
+        "--direction",
+        direction,
+        "--amount",
+        amount.toFixed(4),
+      ],
+      "pane resize",
+    );
+    return response.result?.resize?.changed === true;
+  } catch {
+    return false;
+  }
+}
+
+function rebalanceSurfaces(): void {
+  if (!balancedParent || balancedSurfaces.length === 0) return;
+
+  const totalPanes = balancedSurfaces.length + 1;
+  let layout = readPaneLayout(balancedParent);
+  if (!layout || layout.splits.length < totalPanes - 1) return;
+
+  const width = layout.area.width;
+  const equalColumns = width >= totalPanes * MIN_BALANCED_PANE_WIDTH;
+  const parentShare = equalColumns || totalPanes === 2 ? 1 / totalPanes : 0.4;
+  const agentShare = (1 - parentShare) / balancedSurfaces.length;
+
+  // Herdr reports this left-spine layout from outermost to innermost. The
+  // newest subagent is the outermost right-hand leaf; the parent is the
+  // innermost left-hand leaf.
+  for (let splitIndex = 0; splitIndex < totalPanes - 1; splitIndex++) {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      layout = readPaneLayout(balancedParent) ?? layout;
+      const current = layout.splits[splitIndex]?.ratio;
+      if (typeof current !== "number") break;
+
+      const firstLeafCount = totalPanes - 1 - splitIndex;
+      const firstBranchShare = equalColumns
+        ? firstLeafCount / totalPanes
+        : parentShare + (firstLeafCount - 1) * agentShare;
+      const secondBranchShare = equalColumns ? 1 / totalPanes : agentShare;
+      const target = firstBranchShare / (firstBranchShare + secondBranchShare);
+      const delta = target - current;
+      if (Math.abs(delta) <= 0.01) break;
+
+      const firstBranchRightmost =
+        splitIndex === totalPanes - 2
+          ? balancedParent
+          : balancedSurfaces[splitIndex + 1];
+      const secondBranchLeaf = balancedSurfaces[splitIndex];
+      const pane = delta > 0 ? firstBranchRightmost : secondBranchLeaf;
+      const direction = delta > 0 ? "right" : "left";
+      const changed = resizeSplit(pane, direction, Math.min(Math.abs(delta), MAX_RESIZE_STEP));
+      if (!changed) break;
+    }
+  }
+}
+
+function trackBalancedSurface(parent: string, surface: string): void {
+  if (balancedParent !== parent) {
+    balancedParent = parent;
+    balancedSurfaces.length = 0;
+  }
+  if (!balancedSurfaces.includes(surface)) balancedSurfaces.push(surface);
+  rebalanceSurfaces();
+}
+
+function untrackBalancedSurface(surface: string): boolean {
+  const index = balancedSurfaces.indexOf(surface);
+  if (index < 0) return false;
+  balancedSurfaces.splice(index, 1);
+  return true;
+}
+
 // ── Surface primitives ──
 
 /** Create a right, non-focused pane off the parent pi pane. */
@@ -92,6 +215,13 @@ export function createSurfaceSplit(
   }>(["pane", "split", source, "--direction", direction, "--no-focus"], "pane split");
   const pane = response.result?.pane?.pane_id;
   if (!pane) throw new Error("Herdr pane split returned no pane id.");
+
+  // Only the normal subagent path participates. Tests and callers that create
+  // an arbitrary split from another surface retain Herdr's requested layout.
+  if (direction === "right" && source === process.env.HERDR_PANE_ID) {
+    trackBalancedSurface(source, pane);
+  }
+
   return pane;
 }
 
@@ -168,7 +298,9 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 
 /** Close a Herdr pane. */
 export function closeSurface(surface: string): void {
+  const tracked = untrackBalancedSurface(surface);
   runHerdrJson(["pane", "close", surface], "pane close");
+  if (tracked) rebalanceSurfaces();
 }
 
 // ── Exit polling ──
