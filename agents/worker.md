@@ -1,10 +1,10 @@
 ---
 name: worker
 description: General-purpose worker — reads, writes, and edits code
-tools: read, write, edit, bash, web_search, web_fetch
+tools: read, write, edit, bash, web_search, web_fetch, ask_question
 subagent_agents: scout, researcher
-model: openrouter/z-ai/glm-5.3
-thinking: high
+model: openai-codex/gpt-5.6-luna
+thinking: max
 system-prompt: append
 auto-exit: true
 ---
