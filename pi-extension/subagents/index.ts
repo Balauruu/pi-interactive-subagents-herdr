@@ -219,6 +219,7 @@ function getToolExtensionPath(
   tool: string,
   agentDir: string | null | undefined = getAgentConfigDir(),
   globalAgentDir: string | null | undefined = getGlobalAgentConfigDir(),
+  projectCwd: string | null | undefined = process.cwd(),
 ): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
   // The four spawning tools are registered by THIS extension.
@@ -229,37 +230,66 @@ function getToolExtensionPath(
   const safeBash = join(SUBAGENTS_DIR, "tools", "safe-bash.ts");
   if (tool === "safe_bash" && existsSync(safeBash)) return safeBash;
 
-  const extensionRoots = [agentDir, globalAgentDir].filter(
-    (root, index, roots): root is string => Boolean(root) && roots.indexOf(root) === index,
+  const extensionRoots = [
+    projectCwd
+      ? {
+          legacyRoot: join(projectCwd, ".pi", "extensions"),
+          packageRoot: join(projectCwd, ".pi", "npm"),
+        }
+      : null,
+    agentDir
+      ? {
+          legacyRoot: join(agentDir, "extensions"),
+          packageRoot: join(agentDir, "npm"),
+        }
+      : null,
+    globalAgentDir
+      ? {
+          legacyRoot: join(globalAgentDir, "extensions"),
+          packageRoot: join(globalAgentDir, "npm"),
+        }
+      : null,
+  ].filter(
+    (root, index, roots): root is { legacyRoot: string; packageRoot: string } =>
+      root !== null &&
+      roots.findIndex(
+        (candidate) =>
+          candidate?.legacyRoot === root.legacyRoot && candidate?.packageRoot === root.packageRoot,
+      ) === index,
   );
-  for (const extensionRoot of extensionRoots) {
-    const extBase = join(extensionRoot, "extensions");
-    const legacyMap: Record<string, string> = {
-      web_search: join(extBase, "web-search", "index.ts"),
-      web_fetch: join(extBase, "web-fetch", "index.ts"),
-      video_extract: join(extBase, "video-extract", "index.ts"),
-      youtube_search: join(extBase, "youtube-search", "index.ts"),
-      google_image_search: join(extBase, "google-image-search", "index.ts"),
-    };
-    const legacy = legacyMap[tool];
-    if (legacy && existsSync(legacy)) return legacy;
 
-    const packageMap: Record<string, string> = {
-      web_search: join(extensionRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
-      fetch_content: join(extensionRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
-      source_check: join(extensionRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
-      get_search_content: join(extensionRoot, "npm", "node_modules", "pi-web-access", "index.ts"),
-      ask_user_question: join(
-        extensionRoot,
-        "npm",
-        "node_modules",
-        "@juicesharp",
-        "rpiv-ask-user-question",
-        "index.ts",
-      ),
-    };
+  const legacyMap: Record<string, string> = {
+    web_search: join("web-search", "index.ts"),
+    web_fetch: join("web-fetch", "index.ts"),
+    video_extract: join("video-extract", "index.ts"),
+    youtube_search: join("youtube-search", "index.ts"),
+    google_image_search: join("google-image-search", "index.ts"),
+  };
+  const packageMap: Record<string, string> = {
+    web_search: join("node_modules", "pi-web-access", "index.ts"),
+    fetch_content: join("node_modules", "pi-web-access", "index.ts"),
+    source_check: join("node_modules", "pi-web-access", "index.ts"),
+    get_search_content: join("node_modules", "pi-web-access", "index.ts"),
+    ask_user_question: join(
+      "node_modules",
+      "@juicesharp",
+      "rpiv-ask-user-question",
+      "index.ts",
+    ),
+  };
+
+  for (const { legacyRoot, packageRoot } of extensionRoots) {
+    const legacyPath = legacyMap[tool];
+    if (legacyPath) {
+      const path = join(legacyRoot, legacyPath);
+      if (existsSync(path)) return path;
+    }
+
     const packagePath = packageMap[tool];
-    if (packagePath && existsSync(packagePath)) return packagePath;
+    if (packagePath) {
+      const path = join(packageRoot, packagePath);
+      if (existsSync(path)) return path;
+    }
   }
 
   return EXTRA_TOOL_EXTENSIONS.get(tool);
@@ -888,7 +918,7 @@ function buildSubagentToolAllowlist(
 function applySandboxToParts(
   parts: string[],
   loadout: SubagentLoadout,
-  opts: { artifactDir: string; name: string },
+  opts: { artifactDir: string; name: string; projectCwd?: string | null },
 ): void {
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
@@ -923,6 +953,7 @@ function applySandboxToParts(
         tool,
         loadout.agentDir ?? undefined,
         loadout.globalAgentDir ?? undefined,
+        opts.projectCwd ?? loadout.projectCwd ?? loadout.cwd ?? undefined,
       );
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
@@ -1408,6 +1439,7 @@ async function launchSubagent(
     spawnable: agentDefs?.subagentAgents ?? null,
     autoExit: agentDefs?.autoExit ?? false,
     cwd: effectiveCwd ?? null,
+    projectCwd: targetCwdForSession,
     agentDir: resolvedAgentDir,
     globalAgentDir,
   };
@@ -1415,7 +1447,11 @@ async function launchSubagent(
 
   // Apply model, identity, and the default-deny tool/extension restriction via
   // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+  applySandboxToParts(parts, loadout, {
+    artifactDir,
+    name: params.name,
+    projectCwd: targetCwdForSession,
+  });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = buildAgentDirectoryEnvParts(resolvedAgentDir, globalAgentDir);

@@ -337,6 +337,7 @@ describe("session.ts", () => {
       spawnable: ["scout", "researcher"],
       autoExit: true,
       cwd: "/work/dir",
+      projectCwd: "/work/dir",
       agentDir: "/home/u/.pi/agent",
       globalAgentDir: "/home/u/.pi/agent",
     };
@@ -1238,10 +1239,18 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("applySandboxToParts keeps local packages and falls back to the preserved global root", async () => {
+  it("applySandboxToParts prefers project packages, then local packages, then global packages", async () => {
     await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
       const localAgentDir = join(projectDir, ".pi", "agent");
       process.env.PI_CODING_AGENT_DIR = localAgentDir;
+      const projectWebAccessDir = join(
+        projectDir,
+        ".pi",
+        "npm",
+        "node_modules",
+        "pi-web-access",
+      );
+      const localWebAccessDir = join(localAgentDir, "npm", "node_modules", "pi-web-access");
       const localAskUserQuestionDir = join(
         localAgentDir,
         "npm",
@@ -1257,16 +1266,30 @@ describe("subagent discovery", () => {
         "@juicesharp",
         "rpiv-ask-user-question",
       );
-      mkdirSync(localAskUserQuestionDir, { recursive: true });
-      mkdirSync(globalWebAccessDir, { recursive: true });
-      mkdirSync(globalAskUserQuestionDir, { recursive: true });
+      for (const dir of [
+        projectWebAccessDir,
+        localWebAccessDir,
+        localAskUserQuestionDir,
+        globalWebAccessDir,
+        globalAskUserQuestionDir,
+      ]) {
+        mkdirSync(dir, { recursive: true });
+      }
 
+      const projectWebAccessPath = join(projectWebAccessDir, "index.ts");
+      const localWebAccessPath = join(localWebAccessDir, "index.ts");
       const localAskUserQuestionPath = join(localAskUserQuestionDir, "index.ts");
       const globalWebAccessPath = join(globalWebAccessDir, "index.ts");
       const globalAskUserQuestionPath = join(globalAskUserQuestionDir, "index.ts");
-      writeFileSync(localAskUserQuestionPath, "");
-      writeFileSync(globalWebAccessPath, "");
-      writeFileSync(globalAskUserQuestionPath, "");
+      for (const path of [
+        projectWebAccessPath,
+        localWebAccessPath,
+        localAskUserQuestionPath,
+        globalWebAccessPath,
+        globalAskUserQuestionPath,
+      ]) {
+        writeFileSync(path, "");
+      }
 
       const parts: string[] = [];
       testApi.applySandboxToParts(
@@ -1284,7 +1307,7 @@ describe("subagent discovery", () => {
           agentDir: localAgentDir,
           globalAgentDir: globalDir,
         },
-        { artifactDir: projectDir, name: "scout" },
+        { artifactDir: projectDir, name: "scout", projectCwd: projectDir },
       );
 
       const extensionPaths: string[] = [];
@@ -1292,9 +1315,11 @@ describe("subagent discovery", () => {
         if (parts[i] === "-e") extensionPaths.push(parts[i + 1]);
       }
       assert.deepEqual(extensionPaths, [
-        shellEscape(globalWebAccessPath),
+        shellEscape(projectWebAccessPath),
         shellEscape(localAskUserQuestionPath),
       ]);
+      assert.ok(!extensionPaths.includes(shellEscape(localWebAccessPath)));
+      assert.ok(!extensionPaths.includes(shellEscape(globalWebAccessPath)));
       assert.ok(!extensionPaths.includes(shellEscape(globalAskUserQuestionPath)));
     });
   });
@@ -1314,19 +1339,30 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("keeps legacy extensions local-first across both config roots", async () => {
+  it("keeps legacy extensions local-first across project, local, and global roots", async () => {
     await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
       const localAgentDir = join(projectDir, ".pi", "agent");
-      const localLegacyDir = join(localAgentDir, "extensions", "web-search");
+      const projectLegacyDir = join(projectDir, ".pi", "extensions", "web-search");
+      const localLegacyDir = join(localAgentDir, "extensions", "video-extract");
       const globalLegacyDir = join(globalDir, "extensions", "web-search");
+      const globalVideoLegacyDir = join(globalDir, "extensions", "video-extract");
+      mkdirSync(projectLegacyDir, { recursive: true });
       mkdirSync(localLegacyDir, { recursive: true });
       mkdirSync(globalLegacyDir, { recursive: true });
+      mkdirSync(globalVideoLegacyDir, { recursive: true });
+      const projectLegacyPath = join(projectLegacyDir, "index.ts");
       const localLegacyPath = join(localLegacyDir, "index.ts");
+      writeFileSync(projectLegacyPath, "");
       writeFileSync(localLegacyPath, "");
       writeFileSync(join(globalLegacyDir, "index.ts"), "");
+      writeFileSync(join(globalVideoLegacyDir, "index.ts"), "");
 
       assert.equal(
-        testApi.getToolExtensionPath("web_search", localAgentDir, globalDir),
+        testApi.getToolExtensionPath("web_search", localAgentDir, globalDir, projectDir),
+        projectLegacyPath,
+      );
+      assert.equal(
+        testApi.getToolExtensionPath("video_extract", localAgentDir, globalDir, projectDir),
         localLegacyPath,
       );
     });

@@ -112,6 +112,8 @@ export interface SubagentLoadout {
   autoExit: boolean;
   /** Working directory the subagent ran in, or null. */
   cwd: string | null;
+  /** Project cwd used to resolve project-local resources, when available. */
+  projectCwd?: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
   agentDir: string | null;
   /** Original parent/global agent directory used for package fallback, when available. */
