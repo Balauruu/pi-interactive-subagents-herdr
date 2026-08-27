@@ -72,24 +72,56 @@ export function shellEscape(s: string): string {
 interface PaneLayout {
   area: { width: number };
   panes: Array<{ pane_id: string; rect: { width: number } }>;
-  splits: Array<{ ratio: number }>;
+  splits: Array<{ direction: "right" | "down"; ratio: number }>;
+}
+
+interface SurfacePlacement {
+  direction: "right" | "down";
+  source: string;
+  columnIndex: number;
 }
 
 /**
  * Herdr's default split behavior creates a nested right-hand tree. Repeatedly
  * splitting the parent therefore makes the panes shrink geometrically. Keep
- * the panes created by this extension on a left spine and rebalance its split
- * ratios after every create/close so the columns stay equal when there is
- * enough room. If equal columns would be too narrow, give the parent pane a
- * larger share and divide the remaining space between the subagents.
+ * at most three agent columns beside the parent and rebalance their horizontal
+ * split ratios. Additional agents are distributed vertically across the
+ * shortest columns.
  */
 const MIN_BALANCED_PANE_WIDTH = Math.max(
   1,
   Number(process.env.PI_SUBAGENT_MIN_PANE_WIDTH ?? "24"),
 );
+const MAX_HORIZONTAL_AGENT_COLUMNS = 3;
 const MAX_RESIZE_STEP = 0.05;
 let balancedParent: string | null = null;
-const balancedSurfaces: string[] = [];
+const balancedColumns: string[][] = [];
+
+function chooseSurfacePlacement(
+  parent: string,
+  columns: readonly (readonly string[])[],
+): SurfacePlacement {
+  if (columns.length < MAX_HORIZONTAL_AGENT_COLUMNS) {
+    return { direction: "right", source: parent, columnIndex: columns.length };
+  }
+
+  let columnIndex = 0;
+  for (let index = 1; index < columns.length; index++) {
+    if (columns[index]!.length < columns[columnIndex]!.length) columnIndex = index;
+  }
+
+  const column = columns[columnIndex]!;
+  return {
+    direction: "down",
+    source: column[column.length - 1]!,
+    columnIndex,
+  };
+}
+
+export const __surfaceLayoutTest__ = {
+  chooseSurfacePlacement,
+  maxHorizontalAgentColumns: MAX_HORIZONTAL_AGENT_COLUMNS,
+};
 
 function readPaneLayout(surface: string): PaneLayout | null {
   try {
@@ -132,37 +164,40 @@ function resizeSplit(
 }
 
 function rebalanceSurfaces(): void {
-  if (!balancedParent || balancedSurfaces.length === 0) return;
+  if (!balancedParent || balancedColumns.length === 0) return;
 
-  const totalPanes = balancedSurfaces.length + 1;
+  const balancedSurfaces = balancedColumns.map((column) => column[0]!);
+  const totalColumns = balancedSurfaces.length + 1;
   let layout = readPaneLayout(balancedParent);
-  if (!layout || layout.splits.length < totalPanes - 1) return;
+  let horizontalSplits = layout?.splits.filter((split) => split.direction === "right") ?? [];
+  if (!layout || horizontalSplits.length < totalColumns - 1) return;
 
   const width = layout.area.width;
-  const equalColumns = width >= totalPanes * MIN_BALANCED_PANE_WIDTH;
-  const parentShare = equalColumns || totalPanes === 2 ? 1 / totalPanes : 0.4;
+  const equalColumns = width >= totalColumns * MIN_BALANCED_PANE_WIDTH;
+  const parentShare = equalColumns || totalColumns === 2 ? 1 / totalColumns : 0.4;
   const agentShare = (1 - parentShare) / balancedSurfaces.length;
 
   // Herdr reports this left-spine layout from outermost to innermost. The
-  // newest subagent is the outermost right-hand leaf; the parent is the
+  // oldest agent column is the outermost right-hand branch; the parent is the
   // innermost left-hand leaf.
-  for (let splitIndex = 0; splitIndex < totalPanes - 1; splitIndex++) {
+  for (let splitIndex = 0; splitIndex < totalColumns - 1; splitIndex++) {
     for (let attempt = 0; attempt < 20; attempt++) {
       layout = readPaneLayout(balancedParent) ?? layout;
-      const current = layout.splits[splitIndex]?.ratio;
+      horizontalSplits = layout.splits.filter((split) => split.direction === "right");
+      const current = horizontalSplits[splitIndex]?.ratio;
       if (typeof current !== "number") break;
 
-      const firstLeafCount = totalPanes - 1 - splitIndex;
+      const firstLeafCount = totalColumns - 1 - splitIndex;
       const firstBranchShare = equalColumns
-        ? firstLeafCount / totalPanes
+        ? firstLeafCount / totalColumns
         : parentShare + (firstLeafCount - 1) * agentShare;
-      const secondBranchShare = equalColumns ? 1 / totalPanes : agentShare;
+      const secondBranchShare = equalColumns ? 1 / totalColumns : agentShare;
       const target = firstBranchShare / (firstBranchShare + secondBranchShare);
       const delta = target - current;
       if (Math.abs(delta) <= 0.01) break;
 
       const firstBranchRightmost =
-        splitIndex === totalPanes - 2
+        splitIndex === totalColumns - 2
           ? balancedParent
           : balancedSurfaces[splitIndex + 1];
       const secondBranchLeaf = balancedSurfaces[splitIndex];
@@ -174,27 +209,41 @@ function rebalanceSurfaces(): void {
   }
 }
 
-function trackBalancedSurface(parent: string, surface: string): void {
-  if (balancedParent !== parent) {
-    balancedParent = parent;
-    balancedSurfaces.length = 0;
-  }
-  if (!balancedSurfaces.includes(surface)) balancedSurfaces.push(surface);
-  rebalanceSurfaces();
+function syncBalancedParent(parent: string): void {
+  if (balancedParent === parent) return;
+  balancedParent = parent;
+  balancedColumns.length = 0;
 }
 
 function untrackBalancedSurface(surface: string): boolean {
-  const index = balancedSurfaces.indexOf(surface);
-  if (index < 0) return false;
-  balancedSurfaces.splice(index, 1);
-  return true;
+  for (let columnIndex = 0; columnIndex < balancedColumns.length; columnIndex++) {
+    const column = balancedColumns[columnIndex]!;
+    const surfaceIndex = column.indexOf(surface);
+    if (surfaceIndex < 0) continue;
+
+    column.splice(surfaceIndex, 1);
+    if (column.length === 0) balancedColumns.splice(columnIndex, 1);
+    return true;
+  }
+  return false;
 }
 
 // ── Surface primitives ──
 
-/** Create a right, non-focused pane off the parent pi pane. */
+/** Create a non-focused pane in the next available agent-column slot. */
 export function createSurface(name: string): string {
-  return createSurfaceSplit(name, "right", process.env.HERDR_PANE_ID);
+  const parent = process.env.HERDR_PANE_ID;
+  if (!parent) throw new Error("HERDR_PANE_ID is not set.");
+
+  syncBalancedParent(parent);
+  const placement = chooseSurfacePlacement(parent, balancedColumns);
+  const pane = createSurfaceSplit(name, placement.direction, placement.source);
+
+  if (placement.direction === "down") {
+    balancedColumns[placement.columnIndex]!.push(pane);
+  }
+
+  return pane;
 }
 
 /** Create a Herdr split in the given direction. */
@@ -216,10 +265,10 @@ export function createSurfaceSplit(
   const pane = response.result?.pane?.pane_id;
   if (!pane) throw new Error("Herdr pane split returned no pane id.");
 
-  // Only the normal subagent path participates. Tests and callers that create
-  // an arbitrary split from another surface retain Herdr's requested layout.
   if (direction === "right" && source === process.env.HERDR_PANE_ID) {
-    trackBalancedSurface(source, pane);
+    syncBalancedParent(source);
+    balancedColumns.push([pane]);
+    rebalanceSurfaces();
   }
 
   return pane;

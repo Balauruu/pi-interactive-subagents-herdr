@@ -111,6 +111,28 @@ for (const backend of backends) {
       );
     });
 
+    it("stacks agents vertically after three horizontal agent columns", () => {
+      const parent = getFocusedSurface();
+      assert.ok(parent, "The test runner should have a focused Herdr pane");
+      const surfaces = Array.from({ length: 4 }, (_, index) =>
+        createTrackedSurface(env, `placement-${index + 1}`),
+      );
+
+      const response = JSON.parse(
+        execFileSync("herdr", ["pane", "layout", "--pane", parent], { encoding: "utf8" }),
+      );
+      const panes = response.result.layout.panes;
+      const rects = surfaces.map((pane) => {
+        const rect = panes.find((entry: any) => entry.pane_id === pane)?.rect;
+        assert.ok(rect, `Expected layout rect for ${pane}`);
+        return rect;
+      });
+
+      assert.equal(new Set(rects.slice(0, 3).map((rect) => rect.x)).size, 3);
+      assert.equal(rects[3].x, rects[0].x);
+      assert.notEqual(rects[3].y, rects[0].y);
+    });
+
     it("creates a surface, sends a command, reads output, and closes it", async () => {
       const surface = createTrackedSurface(env, "echo-test");
       await sleep(1000);
