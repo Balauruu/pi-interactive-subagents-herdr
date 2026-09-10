@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -1195,7 +1195,7 @@ function startStatusRefresh(pi: ExtensionAPI, config: ExtensionConfig) {
       pi.sendMessage(
         {
           customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, STATUS_NOTIFICATION_LINE_LIMIT);
+          content: formatStatusAggregate(transitionLines, STATUS_NOTIFICATION_LINE_LIMIT),
           display: true,
           details: { lines: capped.visibleLines, overflow: capped.overflow },
         },
@@ -1219,6 +1219,10 @@ export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
+  setExtensionConfigForTest: (config: ExtensionConfig | null) => {
+    extensionConfig = config;
+  },
+  parseAgentDefinition,
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
@@ -1744,7 +1748,7 @@ async function watchSubagent(
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Fail before registering any hooks or tools so invalid local policy cannot
   // leave a partially initialized extension behind.
-  extensionConfig = loadExtensionConfig();
+  extensionConfig ??= loadExtensionConfig();
   latestPi = pi;
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {

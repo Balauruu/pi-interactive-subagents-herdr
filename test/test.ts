@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -64,6 +64,16 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
+
+const TEST_EXTENSION_CONFIG = Object.freeze({
+  maxActiveSubagents: 4,
+  statusEnabled: true,
+  stalledAfterMs: 30_000,
+});
+
+beforeEach(() => {
+  (subagentsModule as any).__test__.setExtensionConfigForTest(TEST_EXTENSION_CONFIG);
+});
 
 // --- Helpers ---
 
@@ -1112,7 +1122,10 @@ describe("subagent discovery", () => {
   });
 
   it("worker is granted the spawning toolset restricted to scout and researcher", () => {
-    const worker = testApi.loadAgentDefaults("worker");
+    const worker = testApi.parseAgentDefinition(
+      readFileSync(fileURLToPath(new URL("../agents/worker.md", import.meta.url)), "utf8"),
+      "worker",
+    );
     assert.ok(worker, "expected bundled worker to be discoverable");
     assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
 
@@ -2527,6 +2540,7 @@ describe("subagents widget rendering", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
+    testApi.setExtensionConfigForTest(TEST_EXTENSION_CONFIG);
 
     const originalNow = Date.now;
     Date.now = () => 1_000_000;
@@ -2559,7 +2573,7 @@ describe("subagents widget rendering", () => {
           sessionFile: "sess3",
           statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
         },
-      ], 16);
+      ], 16, TEST_EXTENSION_CONFIG);
 
       assert.deepEqual(
         lines.map((line: string) => visibleWidth(line)),
@@ -2583,6 +2597,7 @@ describe("subagents widget rendering", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
+    testApi.setExtensionConfigForTest(TEST_EXTENSION_CONFIG);
 
     const widths = [0, 1, 2];
     for (const width of widths) {
@@ -2597,7 +2612,7 @@ describe("subagents widget rendering", () => {
           sessionFile: "sess1",
           statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
         },
-      ], width);
+      ], width, TEST_EXTENSION_CONFIG);
 
       for (const line of lines) {
         assert.ok(
