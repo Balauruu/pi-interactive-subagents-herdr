@@ -36,18 +36,22 @@ import {
   __surfaceLayoutTest__,
 } from "../pi-extension/subagents/herdr.ts";
 import {
-  advanceStatusState,
+  advanceStatusState as advanceStatusStateWithPolicy,
   capStatusLines,
-  classifyStatus,
+  classifyStatus as classifyStatusWithPolicy,
   createStatusState,
   forceStatusAfterInterrupt,
   formatStatusAggregate,
   formatStatusLine,
   formatTransitionLine,
   observeStatus,
-  loadStatusConfig,
-  parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
+
+const TEST_STALLED_AFTER_MS = 60_000;
+const classifyStatus = (state: Parameters<typeof classifyStatusWithPolicy>[0], now: number) =>
+  classifyStatusWithPolicy(state, now, TEST_STALLED_AFTER_MS);
+const advanceStatusState = (state: Parameters<typeof advanceStatusStateWithPolicy>[0], now: number) =>
+  advanceStatusStateWithPolicy(state, now, TEST_STALLED_AFTER_MS);
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
@@ -688,91 +692,6 @@ describe("session.ts", () => {
 });
 
 describe("status.ts", () => {
-  it("parses strict config objects", () => {
-    const disabled = parseStatusConfig({ status: { enabled: false } });
-
-    assert.deepEqual(disabled, {
-      enabled: false,
-      lineLimit: 4,
-    });
-  });
-
-  it("loads a valid config file", () => {
-    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
-    const config = loadStatusConfig(examplePath);
-
-    assert.deepEqual(config, {
-      enabled: true,
-      lineLimit: 4,
-    });
-  });
-
-  it("loads the shared example when local config is absent", () => {
-    withTempDir((dir) => {
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
-      );
-
-      const config = loadStatusConfig(join(dir, "config.json"), examplePath);
-
-      assert.deepEqual(config, {
-        enabled: true,
-        lineLimit: 4,
-      });
-    });
-  });
-
-  it("fails fast for invalid config shapes", () => {
-    assert.throws(
-      () => parseStatusConfig({ status: { enabled: "false" } }),
-      /status\.enabled must be a boolean/,
-    );
-    assert.throws(
-      () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
-      /status has unsupported key\(s\): defaultCadenceSeconds/,
-    );
-  });
-
-  it("reports when neither local nor shared config exists", () => {
-    withTempDir((dir) => {
-      assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), join(dir, "config.json.example")),
-        /Missing subagent status config\. Expected .*config\.json.*or.*config\.json\.example/,
-      );
-    });
-  });
-
-  it("reports invalid JSON from the shared example path", () => {
-    withTempDir((dir) => {
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(examplePath, "{\n");
-
-      assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), examplePath),
-        /Invalid JSON in subagent config .*config\.json\.example/,
-      );
-    });
-  });
-
-  it("fails on invalid local config instead of falling back to the shared example", () => {
-    withTempDir((dir) => {
-      const configPath = join(dir, "config.json");
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(configPath, "{\n");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
-      );
-
-      assert.throws(
-        () => loadStatusConfig(configPath, examplePath),
-        /Invalid JSON in subagent config .*config\.json/,
-      );
-    });
-  });
-
   it("keeps a missing snapshot as starting until the fixed watchdog threshold", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, { snapshot: "missing" }, 1_000);

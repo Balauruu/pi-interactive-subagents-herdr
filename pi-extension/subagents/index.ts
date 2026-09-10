@@ -42,6 +42,7 @@ import {
   type SubagentLoadout,
 } from "./session.ts";
 import {
+  type ExtensionConfig,
   type StatusSnapshot,
   type SubagentStatusState,
   advanceStatusState,
@@ -52,7 +53,7 @@ import {
   formatStatusAggregate,
   formatTransitionLine,
   observeStatus,
-  loadStatusConfig,
+  loadExtensionConfig,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -69,6 +70,7 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 // the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
+const STATUS_NOTIFICATION_LINE_LIMIT = 4;
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 
 {
@@ -602,7 +604,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
-const statusConfig = loadStatusConfig();
+let extensionConfig: ExtensionConfig | null = null;
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
@@ -797,7 +799,11 @@ function borderBottom(width: number): string {
   return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
 }
 
-function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
+function renderSubagentWidgetLines(
+  agents: RunningSubagent[],
+  width: number,
+  config: Pick<ExtensionConfig, "statusEnabled" | "stalledAfterMs">,
+): string[] {
   const count = agents.length;
   const title = "Subagents";
   const info = `${count} running`;
@@ -807,10 +813,12 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   for (const agent of agents) {
     const elapsed = formatElapsedMMSS(agent.startTime);
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
-    const snapshot = classifyStatus(agent.statusState, Date.now());
-    const icon = widgetIcon(snapshot.kind);
+    const snapshot = config.statusEnabled
+      ? classifyStatus(agent.statusState, Date.now(), config.stalledAfterMs)
+      : null;
+    const icon = widgetIcon(snapshot?.kind ?? (agent.cli === "claude" ? "running" : "starting"));
     const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
-    const right = statusConfig.enabled
+    const right = snapshot
       ? formatWidgetRightLabel(snapshot)
       : agent.cli === "claude"
         ? " running… "
@@ -824,7 +832,8 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 }
 
 function updateWidget() {
-  if (!latestCtx?.hasUI) return;
+  const config = extensionConfig;
+  if (!config || !latestCtx?.hasUI) return;
 
   if (runningSubagents.size === 0) {
     latestCtx.ui.setWidget("subagent-status", undefined);
@@ -842,7 +851,7 @@ function updateWidget() {
       return {
         invalidate() {},
         render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width, config);
         },
       };
     },
@@ -1141,8 +1150,8 @@ function handleSubagentSteer(
   };
 }
 
-function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
+function startStatusRefresh(pi: ExtensionAPI, config: ExtensionConfig) {
+  if (!config.statusEnabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1160,7 +1169,11 @@ function startStatusRefresh(pi: ExtensionAPI) {
 
     for (const running of runningSubagents.values()) {
       observeRunningSubagent(running, now);
-      const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
+      const { nextState, snapshot, transition } = advanceStatusState(
+        running.statusState,
+        now,
+        config.stalledAfterMs,
+      );
       if (nextState.currentKind !== running.statusState.currentKind) {
         shouldRefreshWidget = true;
       }
@@ -1178,11 +1191,11 @@ function startStatusRefresh(pi: ExtensionAPI) {
     if (shouldRefreshWidget) updateWidget();
 
     if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
+      const capped = capStatusLines(transitionLines, STATUS_NOTIFICATION_LINE_LIMIT);
       pi.sendMessage(
         {
           customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
+          content: formatStatusAggregate(transitionLines, STATUS_NOTIFICATION_LINE_LIMIT);
           display: true,
           details: { lines: capped.visibleLines, overflow: capped.overflow },
         },
@@ -1729,6 +1742,9 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  // Fail before registering any hooks or tools so invalid local policy cannot
+  // leave a partially initialized extension behind.
+  extensionConfig = loadExtensionConfig();
   latestPi = pi;
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
@@ -1909,7 +1925,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Start widget refresh and status supervision when the first agent launches
         startWidgetRefresh();
-        startStatusRefresh(pi);
+        startStatusRefresh(pi, extensionConfig);
 
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
@@ -2341,7 +2357,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
         runningSubagents.set(id, running);
         startWidgetRefresh();
-        startStatusRefresh(pi);
+        startStatusRefresh(pi, extensionConfig);
 
         // Fire-and-forget watcher
         const watcherAbort = new AbortController();

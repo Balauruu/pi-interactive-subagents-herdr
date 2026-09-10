@@ -163,13 +163,17 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
+The extension reads exactly one user-owned policy file: package-root `config.json` (copy `config.json.example`; it is gitignored). It must be a plain JSON object with **exactly** these keys. There are no defaults, example-file fallback, nested legacy status policy, or unknown keys. Initialization fails with the file and offending key when the file is absent, malformed, or invalid.
 
 ```json
 {
-  "status": { "enabled": true }
+  "maxActiveSubagents": 3,
+  "statusEnabled": true,
+  "stalledAfterMs": 60000
 }
 ```
+
+`maxActiveSubagents` and `stalledAfterMs` must be positive safe integers. `statusEnabled` must be a boolean. `stalledAfterMs` controls when missing or invalid activity snapshots become stalled; disabling status suppresses status transition registration.
 
 ## Requirements
 
