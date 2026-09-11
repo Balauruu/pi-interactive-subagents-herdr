@@ -377,6 +377,11 @@ export function queuePiInput(surface: string, input: string): void {
   execFileSync("herdr", ["pane", "send-keys", surface, "alt+enter"], { encoding: "utf8" });
 }
 
+/** Exit Pi through its documented clear-then-exit Ctrl+C binding. */
+export function exitPi(surface: string): void {
+  execFileSync("herdr", ["pane", "send-keys", surface, "ctrl+c", "ctrl+c"], { encoding: "utf8" });
+}
+
 // ── Polling helpers ──
 
 /**

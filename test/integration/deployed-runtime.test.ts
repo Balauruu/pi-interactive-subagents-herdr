@@ -12,6 +12,7 @@ import {
   cleanupTestEnv,
   createPaneLayoutWorkspace,
   createTestEnv,
+  exitPi,
   getAvailableBackends,
   getFocusedSurface,
   paneExists,
@@ -187,7 +188,7 @@ if (liveTestPreflight.status === "disabled") {
       await waitForPaneCount(parentPaneId, 1, PI_TIMEOUT);
 
       phase = "parent-exit";
-      queuePiInput(parentPaneId, "/exit");
+      exitPi(parentPaneId);
       assert.equal(await waitForPiExit(parentPaneId, PI_TIMEOUT), 0, "isolated parent Pi must exit cleanly");
 
       phase = "owner-cleanup";
