@@ -120,7 +120,7 @@ describe("pane layout planner", () => {
     assert.equal(closeBeforeLayout.operationCount, 0);
   });
 
-  it("fences a foreign branch before split or rebalance and does not target it", () => {
+  it("fences a foreign branch before split or rebalance by default", () => {
     const ownership = ownershipFor(["root", "owned"]);
     const snapshot = equalLayout(["root", "owned", "foreign"]);
     for (const plan of [planOwnedSplit(ownership, snapshot), planPaneReconciliation(ownership, snapshot)]) {
@@ -128,6 +128,18 @@ describe("pane layout planner", () => {
       assert.equal(plan.reason, "mixed-ownership");
       assert.equal(plan.operationCount, 0);
     }
+  });
+
+  it("allows an explicit root-local split without targeting a foreign pane", () => {
+    const ownership = ownershipFor(["root", "owned"]);
+    const snapshot = equalLayout(["root", "owned", "foreign"]);
+    const plan = planOwnedSplit(ownership, snapshot, { allowForeignPanesForSplit: true });
+
+    assert.equal(plan.state, "completed");
+    assert.equal(plan.reason, "planned");
+    assert.equal(plan.operationCount, 1);
+    assert.equal(plan.operations[0]?.kind, "split");
+    assert.ok(plan.operations[0]?.paneId === "root" || plan.operations[0]?.paneId === "owned");
   });
 
   it("rejects malformed, empty, duplicate, forged, non-finite, and negative input without operations", () => {

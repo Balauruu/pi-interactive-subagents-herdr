@@ -17,6 +17,7 @@ import {
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
@@ -115,12 +116,24 @@ export function createTestEnv(): TestEnv {
   const agentsDir = join(dir, ".pi", "agents");
   mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into the project-local agents dir
+  // Copy test agent definitions into the project-local agents dir. A live
+  // suite must use its explicitly authorized model for nested Pi sessions too,
+  // rather than silently switching providers via fixture frontmatter.
+  const preflight = preflightLiveTest(process.env);
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
-      if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+      if (!file.endsWith(".md")) continue;
+      const source = join(TEST_AGENTS_SRC, file);
+      const destination = join(agentsDir, file);
+      if (preflight.status !== "ready") {
+        cpSync(source, destination);
+        continue;
       }
+      const definition = readFileSync(source, "utf8");
+      if (!/^model:\s*\S+/m.test(definition)) {
+        throw new Error(`Live test agent ${file} does not declare a model.`);
+      }
+      writeFileSync(destination, definition.replace(/^model:\s*\S+/m, `model: ${preflight.model}`));
     }
   }
 

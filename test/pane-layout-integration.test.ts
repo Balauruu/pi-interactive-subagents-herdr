@@ -146,6 +146,20 @@ describe("async owner-safe Herdr pane coordinator", () => {
     assert.equal(recovered.reason, "planned");
   });
 
+  it("allocates from its root without rebalancing a mixed ancestor branch", async () => {
+    const fake = new FakeHerdr();
+    fake.foreign = true;
+    const coordinator = new PaneLayoutCoordinator({ rootPaneId: ROOT, executor: fake });
+
+    const paneId = await coordinator.allocate();
+
+    assert.equal(paneId, "workspace:p2");
+    assert.deepEqual([...coordinator.ownedPaneIds], ["workspace:p2"]);
+    assert.deepEqual(fake.calls.map(({ args }) => args[1]), ["layout", "split", "layout"]);
+    assert.deepEqual(callsFor(fake, "split")[0]?.args.slice(2), [ROOT, "--direction", "down", "--no-focus"]);
+    assert.equal(callsFor(fake, "resize").length, 0);
+  });
+
   it("never mutates a foreign or stale pane and makes repeated cleanup idempotent", async () => {
     const foreign = new FakeHerdr();
     foreign.foreign = true;

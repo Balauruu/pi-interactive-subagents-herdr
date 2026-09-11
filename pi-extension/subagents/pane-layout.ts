@@ -82,6 +82,8 @@ export interface PlannerOptions {
   signal?: AbortSignal;
   /** Area variance tolerated before a resize is considered useful. */
   balanceTolerance?: number;
+  /** Permit a root-local split when unrelated panes share an ancestor branch. */
+  allowForeignPanesForSplit?: boolean;
 }
 
 const DEFAULT_MAX_OPERATIONS = 8;
@@ -200,7 +202,7 @@ function validateSnapshot(ownership: PaneOwnership, value: unknown, options: Pla
   for (const paneId of trusted) {
     if (!present.has(paneId)) return { plan: emptyPlan(ownership, "skipped", "stale-owned-pane") };
   }
-  if (parsed.layout.panes.some((pane) => !trusted.has(pane.paneId))) {
+  if (!options.allowForeignPanesForSplit && parsed.layout.panes.some((pane) => !trusted.has(pane.paneId))) {
     return { plan: emptyPlan(ownership, "skipped", "mixed-ownership") };
   }
   return { layout: parsed.layout, trusted };
@@ -231,7 +233,8 @@ export function planOwnedSplit(ownership: PaneOwnership, snapshot: unknown, opti
   if ("plan" in validated) return validated.plan;
   if (operationBudget(options) < 1) return emptyPlan(ownership, "failed", "command-budget-exhausted");
 
-  const source = sortByAreaThenId(validated.layout.panes)[0]!;
+  const trustedPanes = validated.layout.panes.filter((pane) => validated.trusted.has(pane.paneId));
+  const source = sortByAreaThenId(trustedPanes)[0]!;
   const direction = source.rect.width >= source.rect.height ? "right" : "down";
   const operations: LayoutOperation[] = [{ kind: "split", paneId: source.paneId, direction }];
   return {

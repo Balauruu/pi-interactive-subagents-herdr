@@ -217,7 +217,11 @@ export class PaneLayoutCoordinator {
   async allocate(signal?: AbortSignal): Promise<string> {
     const read = await this.#snapshot(signal);
     if (read.outcome) throw new Error(`Herdr layout allocation failed: ${read.outcome.reason}`);
-    const plan = planOwnedSplit(this.#ownership, read.snapshot, { signal, maxOperations: this.#maxOperations });
+    const plan = planOwnedSplit(this.#ownership, read.snapshot, {
+      signal,
+      maxOperations: this.#maxOperations,
+      allowForeignPanesForSplit: true,
+    });
     if (plan.state !== "completed" || plan.reason !== "planned" || plan.operations[0]?.kind !== "split") {
       throw new Error(`Herdr layout allocation skipped: ${plan.reason}`);
     }
