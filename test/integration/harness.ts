@@ -40,6 +40,7 @@ import {
   preflightLiveTest,
   type LiveTestPreflight,
 } from "../live-test-guard.ts";
+import { verifyDeployment } from "../../scripts/deploy-active-package.ts";
 
 // Re-export Herdr surface primitives for tests
 export {
@@ -101,6 +102,8 @@ export function getFocusedSurface(): string | null {
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
+  /** Dedicated Pi session store; never shares the planning session. */
+  sessionDir: string;
   /** Panes created during the test (cleaned up automatically) */
   surfaces: string[];
   /** Temp files to clean up */
@@ -137,7 +140,9 @@ export function createTestEnv(): TestEnv {
     }
   }
 
-  return { dir, surfaces: [], tempFiles: [] };
+  const sessionDir = join(dir, ".pi-test-sessions");
+  mkdirSync(sessionDir, { recursive: true });
+  return { dir, sessionDir, surfaces: [], tempFiles: [] };
 }
 
 /**
@@ -248,6 +253,10 @@ export function cleanupPaneLayoutWorkspace(workspace: PaneLayoutWorkspace): void
   }
 }
 
+export function paneExists(rootPaneId: string, paneId: string): boolean {
+  return readPaneLayout(rootPaneId).panes.some((pane) => pane.paneId === paneId);
+}
+
 // ── Pi session management ──
 
 /**
@@ -295,6 +304,62 @@ export function startPi(
   });
 }
 
+export interface DeployedRuntimeIdentityOptions {
+  agentDir: string;
+  repo: string;
+  rollback: string;
+}
+
+/** Prove normal package discovery resolves the same approved candidate as the active settings pin. */
+export function verifyDeployedRuntimeIdentity(options: DeployedRuntimeIdentityOptions) {
+  return verifyDeployment({
+    settings: join(resolve(options.agentDir), "settings.json"),
+    repo: resolve(options.repo),
+    rollback: resolve(options.rollback),
+  });
+}
+
+export interface DeployedPiCommandOptions {
+  agentDir: string;
+  sessionDir: string;
+  testDir: string;
+  task: string;
+  model: string;
+}
+
+/** Build a normal auto-discovery command with no source or extension overrides. */
+export function buildDeployedPiCommand(options: DeployedPiCommandOptions): string {
+  for (const [label, value] of Object.entries({
+    agentDir: options.agentDir,
+    sessionDir: options.sessionDir,
+    testDir: options.testDir,
+    model: options.model,
+  })) {
+    if (!value || value.trim() === "") throw new Error(`Deployed Pi ${label} is required.`);
+  }
+  return [
+    `cd ${shellEscape(resolve(options.testDir))} &&`,
+    `PI_CODING_AGENT_DIR=${shellEscape(resolve(options.agentDir))}`,
+    `PI_CODING_AGENT_SESSION_DIR=${shellEscape(resolve(options.sessionDir))}`,
+    "pi",
+    `--model ${shellEscape(options.model)}`,
+    shellEscape(options.task),
+  ].join(" ");
+}
+
+/** Start a distinct Pi process through the active package ownership path. */
+export function startDeployedPi(surface: string, options: Omit<DeployedPiCommandOptions, "model">): void {
+  const preflight = preflightLiveTest(process.env);
+  if (preflight.status === "disabled") throw new Error("Live test guard rejected: PI_LIVE_TESTS is missing.");
+  if (preflight.status === "rejected") throw new Error(formatLiveTestPreflightFailure(preflight));
+
+  mkdirSync(options.sessionDir, { recursive: true });
+  const command = buildDeployedPiCommand({ ...options, model: preflight.model });
+  sendLongCommand(surface, `${command}; echo '__TEST_DONE_'$?'__'`, {
+    scriptPath: join(options.testDir, `test-deployed-launch-${Date.now()}.sh`),
+  });
+}
+
 // ── Polling helpers ──
 
 /**
@@ -313,7 +378,7 @@ export async function waitForScreen(
       const screen = await readScreenAsync(surface, lines);
       if (pattern.test(screen)) return screen;
     } catch {}
-    await sleep(2000);
+    await sleep(Math.min(2000, Math.max(0, timeout - (Date.now() - start))));
   }
 
   let finalScreen = "";
@@ -336,11 +401,13 @@ export async function waitForFile(
 ): Promise<string> {
   const start = Date.now();
   while (Date.now() - start < timeout) {
-    if (existsSync(path)) {
-      const content = readFileSync(path, "utf8");
-      if (!contentPattern || contentPattern.test(content)) return content;
-    }
-    await sleep(2000);
+    try {
+      if (existsSync(path)) {
+        const content = readFileSync(path, "utf8");
+        if (!contentPattern || contentPattern.test(content)) return content;
+      }
+    } catch {}
+    await sleep(Math.min(2000, Math.max(0, timeout - (Date.now() - start))));
   }
   throw new Error(
     `Timeout (${timeout}ms) waiting for file: ${path}` +
