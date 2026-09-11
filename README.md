@@ -38,15 +38,23 @@ Settlement independently claims `extraction`, `delivery`, `release`, `cleanup`, 
 
 A reconciliation returns only a structured, redacted outcome: root ID, owned-pane count, operation count, state, and stable reason. It does not retain raw Herdr output. The coordinator uses argv-based `execFile` calls, a three-second command timeout, `AbortSignal` propagation, root-scoped reconciliation coalescing, and a fixed eight-operation budget. Split failure rejects a launch. Layout or cleanup failure remains a separately recorded retryable lifecycle action and never blocks evidence delivery or admission release.
 
-The provider-free real-CLI suite creates a unique no-focus Herdr workspace rooted in a temporary directory, performs split, layout, bounded resize, and owned close operations, then closes the workspace and removes that directory in `finally` cleanup. It verifies that the caller pane remains unchanged and accepts a minimum pane-area ratio of `0.60` as reasonably symmetric after representative spawn and cleanup sequences. This permits Herdr's single bounded fractional correction while rejecting an unchanged 1:2 split.
+The real-CLI suite creates a unique no-focus Herdr workspace rooted in a temporary directory, performs split, layout, bounded resize, and owned close operations, then closes the workspace and removes that directory in `finally` cleanup. It verifies that the caller pane remains unchanged and accepts a minimum pane-area ratio of `0.60` as reasonably symmetric after representative spawn and cleanup sequences. This permits Herdr's single bounded fractional correction while rejecting an unchanged 1:2 split.
+
+All live integration entrypoints use the same fail-closed preflight before detecting Herdr or allocating resources. They require `PI_LIVE_TESTS=1`, a non-empty syntactically valid `PI_TEST_MODEL` in `provider/model` form, and the active Herdr caller context. The guard skips only when no opt-in is supplied. An invalid opt-in, model, caller context, or unavailable Herdr infrastructure fails non-zero and names only the missing or invalid variable, never its value. There is no default test model.
 
 Run the real workspace suite only from a Herdr-managed pane:
 
 ```bash
-PI_LIVE_TESTS=1 PI_TEST_MODEL=anthropic/claude-haiku-4-5 npm run test:layout:integration
+PI_LIVE_TESTS=1 PI_TEST_MODEL='provider/model' npm run test:layout:integration
 ```
 
-`PI_TEST_MODEL` is accepted by the shared integration environment but this pane-only suite does not start Pi or invoke a provider. Outside a Herdr caller context it reports a skipped test rather than controlling a focused session. `npm test` remains the offline verification for the planner and failure/cancellation paths. S05 owns broader diagnostics, offline regressions, and guarded authorized live tests. S06 owns verification of the active deployed artifact and the complete real child/pane lifecycle.
+Run one bounded provider-backed smoke test with the same explicit authorization:
+
+```bash
+PI_LIVE_TESTS=1 PI_TEST_MODEL='provider/model' npm run test:provider:integration
+```
+
+The provider command runs only the basic spawn-and-completion case with the suite's existing bounded timeout and `finally` cleanup. `npm test` remains the offline verification for the planner and failure/cancellation paths. S05 owns broader diagnostics, offline regressions, and guarded authorized live tests. S06 owns verification of the active deployed artifact and the complete real child/pane lifecycle.
 
 ## Tools
 

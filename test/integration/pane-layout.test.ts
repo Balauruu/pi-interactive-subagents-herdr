@@ -1,7 +1,7 @@
 /**
- * Real, provider-free coverage for owner-scoped Herdr layout reconciliation.
+ * Real coverage for owner-scoped Herdr layout reconciliation.
  *
- * This suite intentionally runs only inside a live Herdr pane. It creates its
+ * This suite intentionally runs only inside an explicitly authorized live Herdr pane. It creates its
  * own no-focus workspace and always removes that workspace in finally cleanup.
  */
 import assert from "node:assert/strict";
@@ -13,11 +13,12 @@ import {
   type HerdrExecutor,
   type PaneLayoutOutcome,
 } from "../../pi-extension/subagents/herdr.ts";
+import { formatLiveTestPreflightFailure, preflightLiveTest } from "../live-test-guard.ts";
 import {
   cleanupPaneLayoutWorkspace,
   createPaneLayoutWorkspace,
+  getAvailableBackends,
   getFocusedSurface,
-  isPaneLayoutIntegrationAvailable,
   readPaneLayout,
   uniqueId,
 } from "./harness.ts";
@@ -50,8 +51,17 @@ function assertOutcome(outcome: PaneLayoutOutcome, rootPaneId: string, ownedPane
   assert.equal(typeof outcome.reason, "string");
 }
 
-if (!isPaneLayoutIntegrationAvailable()) {
-  test("pane layout integration requires PI_LIVE_TESTS=1 inside Herdr", { skip: "live Herdr caller context is unavailable" }, () => {});
+const liveTestPreflight = preflightLiveTest(process.env);
+const backends = getAvailableBackends(liveTestPreflight);
+
+if (liveTestPreflight.status === "disabled") {
+  test("pane layout integration requires PI_LIVE_TESTS=1", { skip: "PI_LIVE_TESTS is not enabled" }, () => {});
+} else if (liveTestPreflight.status === "rejected") {
+  test("pane layout integration preflight fails closed", () => assert.fail(formatLiveTestPreflightFailure(liveTestPreflight)));
+} else if (backends.length === 0) {
+  test("pane layout integration requires available infrastructure", () =>
+    assert.fail("Live test guard rejected: Herdr infrastructure is unavailable."),
+  );
 } else {
   test("keeps real Herdr layout balanced and owner-scoped through spawn and cleanup", { timeout: 60_000 }, async () => {
     const callerPaneId = getFocusedSurface();

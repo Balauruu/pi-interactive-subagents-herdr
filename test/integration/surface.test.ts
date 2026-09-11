@@ -4,14 +4,14 @@
  * These tests exercise real Herdr operations: creating panes, sending commands,
  * reading screen output, and closing panes. No LLM calls - fast and free.
  *
- * Run inside Herdr:
- *   herdr
- *   npm run test:integration
+ * Run from an active Herdr caller context:
+ *   PI_LIVE_TESTS=1 PI_TEST_MODEL='provider/model' npm run test:integration
  */
 import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { unlinkSync } from "node:fs";
+import { formatLiveTestPreflightFailure, preflightLiveTest } from "../live-test-guard.ts";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -33,10 +33,17 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const backends = getAvailableBackends();
-if (backends.length === 0) {
-  console.log("⚠️  Herdr is not available - skipping Herdr surface integration tests");
-  console.log("   Run inside Herdr to enable these tests.");
+const liveTestPreflight = preflightLiveTest(process.env);
+const backends = getAvailableBackends(liveTestPreflight);
+
+if (liveTestPreflight.status === "disabled") {
+  it("Herdr surface integration requires PI_LIVE_TESTS=1", { skip: "PI_LIVE_TESTS is not enabled" }, () => {});
+} else if (liveTestPreflight.status === "rejected") {
+  it("Herdr surface integration preflight fails closed", () => assert.fail(formatLiveTestPreflightFailure(liveTestPreflight)));
+} else if (backends.length === 0) {
+  it("Herdr surface integration requires available infrastructure", () =>
+    assert.fail("Live test guard rejected: Herdr infrastructure is unavailable."),
+  );
 }
 
 for (const backend of backends) {

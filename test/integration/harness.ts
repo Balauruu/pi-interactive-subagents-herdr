@@ -34,6 +34,11 @@ import {
   shellEscape,
 } from "../../pi-extension/subagents/herdr.ts";
 import { parseHerdrPaneLayout, type HerdrPaneLayout } from "../../pi-extension/subagents/pane-layout.ts";
+import {
+  formatLiveTestPreflightFailure,
+  preflightLiveTest,
+  type LiveTestPreflight,
+} from "../live-test-guard.ts";
 
 // Re-export Herdr surface primitives for tests
 export {
@@ -68,17 +73,17 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 
 // ── Configuration ──
 
-/** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
-
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
 // ── Backend detection ──
 
-/** Detect whether Herdr is available in the current environment. */
-export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["herdr"] : [];
+/**
+ * Detect Herdr only after the shared live-test preflight has authorized it.
+ * This keeps accidental test runs from probing external infrastructure.
+ */
+export function getAvailableBackends(preflight: LiveTestPreflight): string[] {
+  return preflight.status === "ready" && isMuxAvailable() ? ["herdr"] : [];
 }
 
 export function getFocusedSurface(): string | null {
@@ -178,14 +183,6 @@ export interface PaneLayoutWorkspace {
   dir: string;
 }
 
-/**
- * Real layout tests are opt-in and require Herdr's caller context. They never
- * start pi or invoke a provider, so the supplied model environment is ignored.
- */
-export function isPaneLayoutIntegrationAvailable(): boolean {
-  return process.env.PI_LIVE_TESTS === "1" && process.env.HERDR_ENV === "1" && isMuxAvailable();
-}
-
 function herdrJson(args: string[]): unknown {
   let stdout: string;
   try {
@@ -251,9 +248,17 @@ export function startPi(
   surface: string,
   testDir: string,
   task: string,
-  opts?: { model?: string; extraArgs?: string },
+  opts?: { extraArgs?: string },
 ): void {
-  const model = opts?.model ?? TEST_MODEL;
+  const preflight = preflightLiveTest(process.env);
+  if (preflight.status === "disabled") {
+    throw new Error("Live test guard rejected: PI_LIVE_TESTS is missing.");
+  }
+  if (preflight.status === "rejected") {
+    throw new Error(formatLiveTestPreflightFailure(preflight));
+  }
+
+  const model = preflight.model;
   const extra = opts?.extraArgs ?? "";
 
   // Force pi to load the working-tree extension (not an installed pi-package

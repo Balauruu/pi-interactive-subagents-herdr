@@ -1,24 +1,24 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
+ * These tests spawn REAL pi sessions with explicitly authorized LLM calls.
  * Each test creates a Herdr pane, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
- * Costs: ~$0.01-0.05 per test run (haiku).
+ * Costs depend on the explicitly selected provider/model.
  * Duration: ~30-90s per test.
  *
  * Run inside Herdr:
- *   herdr
- *   npm run test:integration
+ *   PI_LIVE_TESTS=1 PI_TEST_MODEL='provider/model' npm run test:provider:integration
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
+ *   PI_TEST_MODEL     — required provider/model identifier for all pi sessions
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { formatLiveTestPreflightFailure, preflightLiveTest } from "../live-test-guard.ts";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -35,11 +35,16 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const backends = getAvailableBackends();
+const liveTestPreflight = preflightLiveTest(process.env);
+const backends = getAvailableBackends(liveTestPreflight);
+const providerSmokeName = "spawns a subagent that writes a file and verifies the session";
 
-if (backends.length === 0) {
-  console.log("⚠️  Herdr is not available - skipping subagent lifecycle integration tests");
-  console.log("   Run inside Herdr to enable these tests.");
+if (liveTestPreflight.status === "disabled") {
+  it(providerSmokeName, { skip: "PI_LIVE_TESTS is not enabled" }, () => {});
+} else if (liveTestPreflight.status === "rejected") {
+  it(providerSmokeName, () => assert.fail(formatLiveTestPreflightFailure(liveTestPreflight)));
+} else if (backends.length === 0) {
+  it(providerSmokeName, () => assert.fail("Live test guard rejected: Herdr infrastructure is unavailable."));
 }
 
 for (const backend of backends) {
@@ -56,7 +61,7 @@ for (const backend of backends) {
 
     // ── Basic spawn + completion ──
 
-    it("spawns a subagent that writes a file and verifies the session", async () => {
+    it(providerSmokeName, async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
       trackTempFile(env, markerFile);
