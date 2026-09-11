@@ -19,6 +19,10 @@ import {
   readFileSync,
   writeFileSync,
   unlinkSync,
+  closeSync,
+  openSync,
+  readSync,
+  statSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -426,6 +430,63 @@ export async function waitForFile(
     `Timeout (${timeout}ms) waiting for file: ${path}` +
       (contentPattern ? ` matching ${contentPattern}` : ""),
   );
+}
+
+const SESSION_SCAN_BYTE_LIMIT = 1024 * 1024;
+
+function readSessionTail(path: string, remaining: number): string {
+  const size = statSync(path).size;
+  const bytesToRead = Math.min(size, remaining);
+  if (bytesToRead === 0) return "";
+  const descriptor = openSync(path, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    const bytesRead = readSync(descriptor, buffer, 0, bytesToRead, size - bytesToRead);
+    return buffer.toString("utf8", 0, bytesRead);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+/** Wait for a successful extension-delivered subagent result in the isolated Pi session store. */
+export async function waitForDeliveredSubagent(
+  sessionDir: string,
+  name: string,
+  timeout: number = PI_TIMEOUT,
+): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    try {
+      let remaining = SESSION_SCAN_BYTE_LIMIT;
+      const paths = readdirSync(sessionDir, { encoding: "utf8", recursive: true })
+        .filter((path) => path.endsWith(".jsonl"))
+        .sort()
+        .reverse();
+      for (const relativePath of paths) {
+        if (remaining === 0) break;
+        const content = readSessionTail(join(sessionDir, relativePath), remaining);
+        remaining -= Buffer.byteLength(content);
+        for (const line of content.split("\n")) {
+          try {
+            const entry = JSON.parse(line) as {
+              type?: string;
+              message?: { role?: string; customType?: string; details?: { name?: string; exitCode?: number } };
+            };
+            const message = entry.type === "message" ? entry.message : undefined;
+            if (message?.role !== "custom" || message.customType !== "subagent_result" || message.details?.name !== name) continue;
+            if (message.details.exitCode !== 0) throw new Error(`Subagent ${name} delivered exit code ${message.details.exitCode}`);
+            return;
+          } catch (error) {
+            if (error instanceof Error && error.message.startsWith(`Subagent ${name} delivered`)) throw error;
+          }
+        }
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith(`Subagent ${name} delivered`)) throw error;
+    }
+    await sleep(Math.min(2000, Math.max(0, timeout - (Date.now() - started))));
+  }
+  throw new Error(`Timeout (${timeout}ms) waiting for delivered subagent result: ${name}`);
 }
 
 /**

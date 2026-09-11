@@ -13,6 +13,7 @@ import {
   queuePiInput,
   sendPiInput,
   verifyDeployedRuntimeIdentity,
+  waitForDeliveredSubagent,
   waitForFile,
 } from "./integration/harness.ts";
 
@@ -102,6 +103,48 @@ test("file polling honors its requested timeout when a marker never appears", as
   const started = Date.now();
   await assert.rejects(() => waitForFile(missing, 25), /Timeout \(25ms\)/);
   assert.ok(Date.now() - started < 250, "polling must not sleep past its bounded timeout");
+});
+
+test("delivered-result polling finds a successful structured parent message", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "deployed-runtime-result-"));
+  try {
+    const nested = join(dir, "cwd");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, "session.jsonl"), [
+      JSON.stringify({ type: "session", id: "header" }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "custom",
+          customType: "subagent_result",
+          details: { name: "Replacement-proof", exitCode: 0 },
+        },
+      }),
+    ].join("\n"));
+    await waitForDeliveredSubagent(dir, "Replacement-proof", 25);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delivered-result polling fails immediately for a matching non-zero result", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "deployed-runtime-result-failed-"));
+  try {
+    writeFileSync(join(dir, "session.jsonl"), JSON.stringify({
+      type: "message",
+      message: {
+        role: "custom",
+        customType: "subagent_result",
+        details: { name: "Replacement-failed", exitCode: 9 },
+      },
+    }));
+    await assert.rejects(
+      () => waitForDeliveredSubagent(dir, "Replacement-failed", 25),
+      /delivered exit code 9/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("deployed Pi input rejects an empty user turn before touching Herdr", () => {

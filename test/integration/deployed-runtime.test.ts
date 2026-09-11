@@ -21,6 +21,7 @@ import {
   startDeployedPi,
   uniqueId,
   verifyDeployedRuntimeIdentity,
+  waitForDeliveredSubagent,
   waitForFile,
   waitForPiExit,
   waitForScreen,
@@ -167,7 +168,7 @@ if (liveTestPreflight.status === "disabled") {
         "cap+1 rejection must not allocate another child pane",
       );
       const initialDeliveryProofs = startFiles.map((_, index) =>
-        waitForScreen(parentPaneId, new RegExp(`✓\\s+Deploy-${id}-${index}`), PI_TIMEOUT, 240));
+        waitForDeliveredSubagent(env!.sessionDir, `Deploy-${id}-${index}`, PI_TIMEOUT));
       writeFileSync(releaseFile, `RELEASE_${id}\n`);
 
       phase = "delivery-and-release";
@@ -182,7 +183,7 @@ if (liveTestPreflight.status === "disabled") {
         `Do not make any other tool call in this turn.`,
       ].join(" "));
       await waitForFile(replacementFile, PI_TIMEOUT, new RegExp(`REPLACEMENT_${id}`));
-      await waitForScreen(parentPaneId, new RegExp(`✓\\s+Replacement-${id}`), PI_TIMEOUT, 240);
+      await waitForDeliveredSubagent(env.sessionDir, `Replacement-${id}`, PI_TIMEOUT);
       await waitForPaneCount(parentPaneId, 1, PI_TIMEOUT);
 
       phase = "parent-exit";
