@@ -41,6 +41,21 @@ function assertBalanced(rootPaneId: string, expectedPaneIds?: readonly string[])
   assert.ok(smallest / largest >= MIN_AREA_RATIO, `layout area ratio ${smallest / largest} is below ${MIN_AREA_RATIO}`);
 }
 
+async function waitForBalanced(rootPaneId: string, timeout: number = PI_TIMEOUT): Promise<void> {
+  const started = Date.now();
+  let lastError: unknown;
+  while (Date.now() - started < timeout) {
+    try {
+      assertBalanced(rootPaneId);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw lastError;
+}
+
 function boundedDiagnostics(rootPaneId: string, parentPaneId: string, phase: string): string {
   let layout = "unavailable";
   let screen = "unavailable";
@@ -119,7 +134,7 @@ if (liveTestPreflight.status === "disabled") {
       phase = "admission";
       await Promise.all(startFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`START_${id}_${index}`))));
       assert.equal(existsSync(extraFile), false, "cap+1 must not write a marker while the configured active slots are occupied");
-      assertBalanced(parentPaneId);
+      await waitForBalanced(parentPaneId);
       assert.equal(readPaneLayout(parentPaneId).panes.length, cap + 1, "cap+1 must not allocate another child pane");
 
       phase = "delivery-and-release";
