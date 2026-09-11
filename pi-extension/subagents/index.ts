@@ -27,6 +27,7 @@ import {
   readScreen,
 } from "./herdr.ts";
 import {
+  abandonLifecycleRun,
   admitLifecycleRun,
   lifecycleEnvParts,
   markLifecycleRunning,
@@ -1333,7 +1334,14 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  let surface: string;
+  try {
+    surface = options?.surface ?? await createSurface(params.name);
+  } catch (error) {
+    lifecycleRuns.delete(id);
+    await abandonLifecycleRun(lifecycle, error);
+    throw error;
+  }
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -1731,7 +1739,10 @@ async function watchSubagent(
       }
 
       if (lifecycle) await settleLifecycleRun(lifecycle, { cleanup: () => closeSurface(surface), layout: layoutSurfaces });
-      else closeSurface(surface);
+      else {
+        await closeSurface(surface);
+        await layoutSurfaces();
+      }
       lifecycleRuns.delete(running.id);
       runningSubagents.delete(running.id);
 
@@ -1760,7 +1771,13 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    if (lifecycle) {
+      await settleLifecycleRun(lifecycle, { cleanup: () => closeSurface(surface), layout: layoutSurfaces });
+      lifecycleRuns.delete(running.id);
+    } else {
+      await closeSurface(surface);
+      await layoutSurfaces();
+    }
     runningSubagents.delete(running.id);
 
     return {
@@ -1776,7 +1793,13 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
-      closeSurface(surface);
+      if (lifecycle) {
+        await settleLifecycleRun(lifecycle, { cleanup: () => closeSurface(surface), layout: layoutSurfaces });
+        lifecycleRuns.delete(running.id);
+      } else {
+        await closeSurface(surface);
+        await layoutSurfaces();
+      }
     } catch {}
     runningSubagents.delete(running.id);
 
@@ -2325,7 +2348,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
         lifecycleRuns.set(id, lifecycle);
         markLifecycleRunning(lifecycle);
-        const surface = createSurface(name);
+        let surface: string;
+        try {
+          surface = await createSurface(name);
+        } catch (error) {
+          lifecycleRuns.delete(id);
+          await abandonLifecycleRun(lifecycle, error);
+          throw error;
+        }
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command

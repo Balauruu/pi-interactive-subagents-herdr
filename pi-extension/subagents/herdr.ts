@@ -12,6 +12,18 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  createPaneOwnership,
+  parseHerdrPaneLayout,
+  planOwnedClose,
+  planOwnedSplit,
+  planPaneReconciliation,
+  registerOwnedSplit,
+  unregisterOwnedPane,
+  type LayoutPlan,
+  type LayoutReason,
+  type PaneOwnership,
+} from "./pane-layout.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -51,227 +63,285 @@ function requireHerdr(): void {
   }
 }
 
-function runHerdrJson<T = any>(args: string[], operation: string): T {
-  requireHerdr();
-  const output = execFileSync("herdr", args, { encoding: "utf8" }).trim();
-  try {
-    return JSON.parse(output) as T;
-  } catch (error) {
-    throw new Error(`Invalid Herdr response from ${operation}: ${output}`, { cause: error });
-  }
-}
-
 // ── Shell helpers ──
 
 export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
-// ── Surface layout ──
+// ── Ownership-proven asynchronous surface layout ──
 
-interface PaneLayout {
-  area: { width: number };
-  panes: Array<{ pane_id: string; rect: { width: number } }>;
-  splits: Array<{ direction: "right" | "down"; ratio: number }>;
+/** A redacted outcome suitable for lifecycle diagnostics. Never includes Herdr output. */
+export interface PaneLayoutOutcome {
+  state: "completed" | "skipped" | "cancelled" | "failed";
+  reason: LayoutReason | "command-failed" | "command-timeout" | "invalid-command-response";
+  rootPaneId: string;
+  ownerPaneCount: number;
+  operationCount: number;
 }
 
-interface SurfacePlacement {
-  direction: "right" | "down";
-  source: string;
-  columnIndex: number;
+export interface HerdrExecutor {
+  run(args: readonly string[], options: { timeoutMs: number; signal?: AbortSignal }): Promise<{ stdout: string }>;
+}
+
+export interface PaneLayoutCoordinatorOptions {
+  rootPaneId: string;
+  executor?: HerdrExecutor;
+  commandTimeoutMs?: number;
+  maxOperations?: number;
+}
+
+const DEFAULT_LAYOUT_COMMAND_TIMEOUT_MS = 3_000;
+const DEFAULT_LAYOUT_OPERATION_BUDGET = 8;
+
+function commandReason(error: unknown, signal?: AbortSignal): PaneLayoutOutcome["reason"] {
+  if (signal?.aborted || (error as { name?: string } | undefined)?.name === "AbortError") return "aborted";
+  const commandError = error as { killed?: boolean; signal?: string; code?: string } | undefined;
+  if (commandError?.killed || commandError?.signal === "SIGTERM" || commandError?.code === "ETIMEDOUT") {
+    return "command-timeout";
+  }
+  return "command-failed";
 }
 
 /**
- * Herdr's default split behavior creates a nested right-hand tree. Repeatedly
- * splitting the parent therefore makes the panes shrink geometrically. Keep
- * at most three agent columns beside the parent and rebalance their horizontal
- * split ratios. Additional agents are distributed vertically across the
- * shortest columns.
+ * Production executor: passes every pane id as an argv element, never a shell
+ * fragment. The adapter returns stdout only to the coordinator for immediate
+ * validation and intentionally does not retain command output.
  */
-const MIN_BALANCED_PANE_WIDTH = Math.max(
-  1,
-  Number(process.env.PI_SUBAGENT_MIN_PANE_WIDTH ?? "24"),
-);
-const MAX_HORIZONTAL_AGENT_COLUMNS = 3;
-const MAX_RESIZE_STEP = 0.05;
-let balancedParent: string | null = null;
-const balancedColumns: string[][] = [];
-
-function chooseSurfacePlacement(
-  parent: string,
-  columns: readonly (readonly string[])[],
-): SurfacePlacement {
-  if (columns.length < MAX_HORIZONTAL_AGENT_COLUMNS) {
-    return { direction: "right", source: parent, columnIndex: columns.length };
-  }
-
-  let columnIndex = 0;
-  for (let index = 1; index < columns.length; index++) {
-    if (columns[index]!.length < columns[columnIndex]!.length) columnIndex = index;
-  }
-
-  const column = columns[columnIndex]!;
+export function createHerdrExecutor(): HerdrExecutor {
   return {
-    direction: "down",
-    source: column[column.length - 1]!,
-    columnIndex,
+    async run(args, options) {
+      requireHerdr();
+      const { stdout } = await execFileAsync("herdr", [...args], {
+        encoding: "utf8",
+        timeout: options.timeoutMs,
+        signal: options.signal,
+      });
+      return { stdout: String(stdout) };
+    },
   };
 }
 
-export const __surfaceLayoutTest__ = {
-  chooseSurfacePlacement,
-  maxHorizontalAgentColumns: MAX_HORIZONTAL_AGENT_COLUMNS,
-};
-
-function readPaneLayout(surface: string): PaneLayout | null {
+function parseCommandJson(stdout: string): unknown | undefined {
   try {
-    const response = runHerdrJson<{ result?: { layout?: PaneLayout } }>(
-      ["pane", "layout", "--pane", surface],
-      "pane layout",
-    );
-    return response.result?.layout ?? null;
+    return JSON.parse(stdout);
   } catch {
-    return null;
+    return undefined;
   }
 }
 
-function resizeSplit(
-  pane: string,
-  direction: "left" | "right",
-  amount: number,
-): boolean {
-  if (!Number.isFinite(amount) || amount <= 0.001) return false;
-  try {
-    const response = runHerdrJson<{
-      result?: { resize?: { changed?: boolean } };
-    }>(
-      [
-        "pane",
-        "resize",
-        "--pane",
-        pane,
-        "--direction",
-        direction,
-        "--amount",
-        amount.toFixed(4),
-      ],
-      "pane resize",
-    );
-    return response.result?.resize?.changed === true;
-  } catch {
-    return false;
-  }
+function resultPaneId(response: unknown): string | undefined {
+  const candidate = response as {
+    result?: { pane?: { pane_id?: unknown }; pane_id?: unknown; id?: unknown };
+  } | undefined;
+  const paneId = candidate?.result?.pane?.pane_id ?? candidate?.result?.pane_id ?? candidate?.result?.id;
+  return typeof paneId === "string" ? paneId : undefined;
 }
 
-function rebalanceSurfaces(): void {
-  if (!balancedParent || balancedColumns.length === 0) return;
+function outcomeFromPlan(plan: LayoutPlan): PaneLayoutOutcome {
+  return {
+    state: plan.state,
+    reason: plan.reason,
+    rootPaneId: plan.rootPaneId,
+    ownerPaneCount: plan.ownedPaneCount,
+    operationCount: plan.operationCount,
+  };
+}
 
-  const balancedSurfaces = balancedColumns.map((column) => column[0]!);
-  const totalColumns = balancedSurfaces.length + 1;
-  let layout = readPaneLayout(balancedParent);
-  let horizontalSplits = layout?.splits.filter((split) => split.direction === "right") ?? [];
-  if (!layout || horizontalSplits.length < totalColumns - 1) return;
+function failedOutcome(
+  ownership: PaneOwnership,
+  reason: PaneLayoutOutcome["reason"],
+  operationCount = 0,
+): PaneLayoutOutcome {
+  return {
+    state: reason === "aborted" ? "cancelled" : "failed",
+    reason,
+    rootPaneId: ownership.rootPaneId,
+    ownerPaneCount: ownership.ownedPaneIds.size,
+    operationCount,
+  };
+}
 
-  const width = layout.area.width;
-  const equalColumns = width >= totalColumns * MIN_BALANCED_PANE_WIDTH;
-  const parentShare = equalColumns || totalColumns === 2 ? 1 / totalColumns : 0.4;
-  const agentShare = (1 - parentShare) / balancedSurfaces.length;
+/**
+ * One coordinator exists per trusted root pane. It owns its registered child
+ * ids, serializes reconciliation, and treats layout failures as observable
+ * results rather than destructive cleanup failures.
+ */
+export class PaneLayoutCoordinator {
+  #ownership: PaneOwnership;
+  #executor: HerdrExecutor;
+  #timeoutMs: number;
+  #maxOperations: number;
+  #reconciliation: Promise<PaneLayoutOutcome> | undefined;
 
-  // Herdr reports this left-spine layout from outermost to innermost. The
-  // oldest agent column is the outermost right-hand branch; the parent is the
-  // innermost left-hand leaf.
-  for (let splitIndex = 0; splitIndex < totalColumns - 1; splitIndex++) {
-    for (let attempt = 0; attempt < 20; attempt++) {
-      layout = readPaneLayout(balancedParent) ?? layout;
-      horizontalSplits = layout.splits.filter((split) => split.direction === "right");
-      const current = horizontalSplits[splitIndex]?.ratio;
-      if (typeof current !== "number") break;
+  constructor(options: PaneLayoutCoordinatorOptions) {
+    this.#ownership = createPaneOwnership(options.rootPaneId);
+    this.#executor = options.executor ?? createHerdrExecutor();
+    this.#timeoutMs = options.commandTimeoutMs ?? DEFAULT_LAYOUT_COMMAND_TIMEOUT_MS;
+    this.#maxOperations = options.maxOperations ?? DEFAULT_LAYOUT_OPERATION_BUDGET;
+  }
 
-      const firstLeafCount = totalColumns - 1 - splitIndex;
-      const firstBranchShare = equalColumns
-        ? firstLeafCount / totalColumns
-        : parentShare + (firstLeafCount - 1) * agentShare;
-      const secondBranchShare = equalColumns ? 1 / totalColumns : agentShare;
-      const target = firstBranchShare / (firstBranchShare + secondBranchShare);
-      const delta = target - current;
-      if (Math.abs(delta) <= 0.01) break;
+  get rootPaneId(): string {
+    return this.#ownership.rootPaneId;
+  }
 
-      const firstBranchRightmost =
-        splitIndex === totalColumns - 2
-          ? balancedParent
-          : balancedSurfaces[splitIndex + 1];
-      const secondBranchLeaf = balancedSurfaces[splitIndex];
-      const pane = delta > 0 ? firstBranchRightmost : secondBranchLeaf;
-      const direction = delta > 0 ? "right" : "left";
-      const changed = resizeSplit(pane, direction, Math.min(Math.abs(delta), MAX_RESIZE_STEP));
-      if (!changed) break;
+  get ownedPaneIds(): ReadonlySet<string> {
+    return this.#ownership.ownedPaneIds;
+  }
+
+  async #snapshot(signal?: AbortSignal): Promise<{ snapshot?: unknown; outcome?: PaneLayoutOutcome }> {
+    try {
+      const { stdout } = await this.#executor.run(["pane", "layout", "--pane", this.rootPaneId], {
+        timeoutMs: this.#timeoutMs,
+        signal,
+      });
+      const snapshot = parseCommandJson(stdout);
+      return snapshot === undefined
+        ? { outcome: failedOutcome(this.#ownership, "invalid-command-response") }
+        : { snapshot };
+    } catch (error) {
+      return { outcome: failedOutcome(this.#ownership, commandReason(error, signal)) };
     }
   }
-}
 
-function syncBalancedParent(parent: string): void {
-  if (balancedParent === parent) return;
-  balancedParent = parent;
-  balancedColumns.length = 0;
-}
-
-function untrackBalancedSurface(surface: string): boolean {
-  for (let columnIndex = 0; columnIndex < balancedColumns.length; columnIndex++) {
-    const column = balancedColumns[columnIndex]!;
-    const surfaceIndex = column.indexOf(surface);
-    if (surfaceIndex < 0) continue;
-
-    column.splice(surfaceIndex, 1);
-    if (column.length === 0) balancedColumns.splice(columnIndex, 1);
-    return true;
-  }
-  return false;
-}
-
-// ── Surface primitives ──
-
-/** Create a non-focused pane in the next available agent-column slot. */
-export function createSurface(name: string): string {
-  const parent = process.env.HERDR_PANE_ID;
-  if (!parent) throw new Error("HERDR_PANE_ID is not set.");
-
-  syncBalancedParent(parent);
-  const placement = chooseSurfacePlacement(parent, balancedColumns);
-  const pane = createSurfaceSplit(name, placement.direction, placement.source);
-
-  if (placement.direction === "down") {
-    balancedColumns[placement.columnIndex]!.push(pane);
+  async #run(args: string[], signal?: AbortSignal): Promise<PaneLayoutOutcome | undefined> {
+    try {
+      await this.#executor.run(args, { timeoutMs: this.#timeoutMs, signal });
+      return undefined;
+    } catch (error) {
+      return failedOutcome(this.#ownership, commandReason(error, signal), 1);
+    }
   }
 
-  return pane;
+  /** Allocate one owned pane. Split failure rejects launch, rebalance failure does not revoke ownership. */
+  async allocate(signal?: AbortSignal): Promise<string> {
+    const read = await this.#snapshot(signal);
+    if (read.outcome) throw new Error(`Herdr layout allocation failed: ${read.outcome.reason}`);
+    const plan = planOwnedSplit(this.#ownership, read.snapshot, { signal, maxOperations: this.#maxOperations });
+    if (plan.state !== "completed" || plan.reason !== "planned" || plan.operations[0]?.kind !== "split") {
+      throw new Error(`Herdr layout allocation skipped: ${plan.reason}`);
+    }
+    const operation = plan.operations[0];
+    let allocatedPaneId: string | undefined;
+    try {
+      const { stdout } = await this.#executor.run(
+        ["pane", "split", operation.paneId, "--direction", operation.direction, "--no-focus"],
+        { timeoutMs: this.#timeoutMs, signal },
+      );
+      const paneId = resultPaneId(parseCommandJson(stdout));
+      if (!paneId) throw new Error("invalid split response");
+      const registration = registerOwnedSplit(this.#ownership, paneId);
+      if (registration.state !== "registered") throw new Error(`split registration ${registration.reason}`);
+      this.#ownership = registration.ownership;
+      allocatedPaneId = paneId;
+    } catch (error) {
+      const reason = error instanceof Error && error.message === "invalid split response"
+        ? "invalid-command-response"
+        : commandReason(error, signal);
+      throw new Error(`Herdr pane split failed: ${reason}`);
+    }
+
+    // A post-split layout failure remains observable and retryable through the
+    // separate terminal layout action. It never erases the allocated pane.
+    await this.reconcile(signal);
+    return allocatedPaneId!;
+  }
+
+  /** Coalesce duplicate reconciliation requests per root into one bounded command sequence. */
+  reconcile(signal?: AbortSignal): Promise<PaneLayoutOutcome> {
+    if (this.#reconciliation) return this.#reconciliation;
+    const run = this.#reconcile(signal).finally(() => {
+      if (this.#reconciliation === run) this.#reconciliation = undefined;
+    });
+    this.#reconciliation = run;
+    return run;
+  }
+
+  async #reconcile(signal?: AbortSignal): Promise<PaneLayoutOutcome> {
+    const read = await this.#snapshot(signal);
+    if (read.outcome) return read.outcome;
+    const plan = planPaneReconciliation(this.#ownership, read.snapshot, {
+      signal,
+      maxOperations: this.#maxOperations,
+    });
+    if (plan.state !== "completed" || plan.reason !== "planned") return outcomeFromPlan(plan);
+
+    let completed = 0;
+    for (const operation of plan.operations) {
+      if (operation.kind !== "resize") continue;
+      // Herdr resizes by fraction. Derive a capped one-step correction from
+      // this validated measurement and never loop toward convergence.
+      const parsed = parseHerdrPaneLayout(read.snapshot);
+      const current = parsed.ok ? parsed.layout.panes.find((pane) => pane.paneId === operation.paneId) : undefined;
+      const currentArea = current ? current.rect.width * current.rect.height : operation.targetArea;
+      const amount = Math.min(0.25, Math.max(0.01, Math.abs(operation.targetArea - currentArea) / operation.targetArea));
+      const failed = await this.#run([
+        "pane", "resize", "--pane", operation.paneId, "--direction", operation.direction,
+        "--amount", amount.toFixed(4),
+      ], signal);
+      if (failed) return { ...failed, operationCount: completed + failed.operationCount };
+      completed++;
+    }
+    return { ...outcomeFromPlan(plan), operationCount: completed };
+  }
+
+  /** Close only a pane registered from a successful split. Repeated closes are safe no-ops. */
+  async close(paneId: string, signal?: AbortSignal): Promise<PaneLayoutOutcome> {
+    const read = await this.#snapshot(signal);
+    if (read.outcome) return read.outcome;
+    const plan = planOwnedClose(this.#ownership, read.snapshot, paneId, { signal, maxOperations: this.#maxOperations });
+    if (plan.state !== "completed" || plan.reason !== "planned" || plan.operations[0]?.kind !== "close") {
+      if (plan.reason === "already-closed") {
+        this.#ownership = unregisterOwnedPane(this.#ownership, paneId);
+        return {
+          ...outcomeFromPlan(plan),
+          ownerPaneCount: this.#ownership.ownedPaneIds.size,
+        };
+      }
+      return outcomeFromPlan(plan);
+    }
+    const failed = await this.#run(["pane", "close", paneId], signal);
+    if (failed) return failed;
+    this.#ownership = unregisterOwnedPane(this.#ownership, paneId);
+    return {
+      state: "completed",
+      reason: "planned",
+      rootPaneId: this.rootPaneId,
+      ownerPaneCount: this.#ownership.ownedPaneIds.size,
+      operationCount: 1,
+    };
+  }
 }
 
-/** Create a Herdr split in the given direction. */
-export function createSurfaceSplit(
-  name: string,
+const layoutCoordinators = new Map<string, PaneLayoutCoordinator>();
+
+export function paneLayoutCoordinator(rootPaneId = process.env.HERDR_PANE_ID): PaneLayoutCoordinator {
+  if (!rootPaneId) throw new Error("HERDR_PANE_ID is not set.");
+  let coordinator = layoutCoordinators.get(rootPaneId);
+  if (!coordinator) {
+    coordinator = new PaneLayoutCoordinator({ rootPaneId });
+    layoutCoordinators.set(rootPaneId, coordinator);
+  }
+  return coordinator;
+}
+
+/** Create a non-focused, registered extension pane before process launch. */
+export async function createSurface(_name: string, signal?: AbortSignal): Promise<string> {
+  return paneLayoutCoordinator().allocate(signal);
+}
+
+/** Compatibility wrapper for callers that explicitly choose a split source. */
+export async function createSurfaceSplit(
+  _name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
-): string {
-  void name;
-  if (direction !== "right" && direction !== "down") {
-    throw new Error(`Herdr supports only right and down splits, not ${direction}.`);
+  signal?: AbortSignal,
+): Promise<string> {
+  if (fromSurface && fromSurface !== paneLayoutCoordinator().rootPaneId) {
+    throw new Error("Only the trusted root coordinator may select split sources.");
   }
-
-  const source = fromSurface ?? process.env.HERDR_PANE_ID;
-  if (!source) throw new Error("HERDR_PANE_ID is not set.");
-  const response = runHerdrJson<{
-    result?: { pane?: { pane_id?: string } };
-  }>(["pane", "split", source, "--direction", direction, "--no-focus"], "pane split");
-  const pane = response.result?.pane?.pane_id;
-  if (!pane) throw new Error("Herdr pane split returned no pane id.");
-
-  if (direction === "right" && source === process.env.HERDR_PANE_ID) {
-    syncBalancedParent(source);
-    balancedColumns.push([pane]);
-    rebalanceSurfaces();
-  }
-
-  return pane;
+  if (direction !== "right" && direction !== "down") throw new Error(`Herdr supports only right and down splits, not ${direction}.`);
+  return paneLayoutCoordinator().allocate(signal);
 }
 
 /** Submit a command atomically with Enter. */
@@ -280,40 +350,17 @@ export function sendCommand(surface: string, command: string): void {
   execFileSync("herdr", ["pane", "run", surface, command], { encoding: "utf8" });
 }
 
-/**
- * Send a long command to a pane by writing it to a script file first.
- * This avoids terminal line-wrapping issues that break commands exceeding the
- * pane's column width when sent character-by-character via sendCommand.
- *
- * By default the script is written to a temp directory, but callers can pass a
- * stable path (for example under session artifacts) so the exact invocation is
- * preserved for debugging.
- *
- * Returns the script path.
- */
 export function sendLongCommand(
   surface: string,
   command: string,
   options?: { scriptPath?: string; scriptPreamble?: string },
 ): string {
-  const scriptPath =
-    options?.scriptPath ??
-    join(
-      tmpdir(),
-      "pi-subagent-scripts",
-      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
-    );
+  const scriptPath = options?.scriptPath ?? join(tmpdir(), "pi-subagent-scripts", `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`);
   mkdirSync(dirname(scriptPath), { recursive: true });
-
   const scriptParts = ["#!/bin/bash"];
-  if (options?.scriptPreamble) {
-    scriptParts.push(options.scriptPreamble.trimEnd());
-  }
+  if (options?.scriptPreamble) scriptParts.push(options.scriptPreamble.trimEnd());
   scriptParts.push(command);
-
-  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
-    mode: 0o755,
-  });
+  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", { mode: 0o755 });
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
@@ -334,26 +381,25 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   requireHerdr();
   const common = ["pane", "read", surface, "--format", "text", "--lines", String(Math.max(1, lines))];
   try {
-    const { stdout } = await execFileAsync("herdr", [...common, "--source", "detection"], {
-      encoding: "utf8",
-    });
+    const { stdout } = await execFileAsync("herdr", [...common, "--source", "detection"], { encoding: "utf8" });
     if (stdout.trim()) return stdout;
   } catch {}
-  const { stdout } = await execFileAsync("herdr", [...common, "--source", "visible"], {
-    encoding: "utf8",
-  });
+  const { stdout } = await execFileAsync("herdr", [...common, "--source", "visible"], { encoding: "utf8" });
   return stdout;
 }
 
-/** Close a Herdr pane without changing layout. Ownership is checked by the caller. */
-export function closeSurface(surface: string): void {
-  untrackBalancedSurface(surface);
-  runHerdrJson(["pane", "close", surface], "pane close");
+/** Close a known owned pane. Failures are thrown so lifecycle cleanup remains retryable. */
+export async function closeSurface(surface: string, signal?: AbortSignal): Promise<PaneLayoutOutcome> {
+  const outcome = await paneLayoutCoordinator().close(surface, signal);
+  if (outcome.state === "failed" || outcome.state === "cancelled") throw new Error(`Herdr pane close failed: ${outcome.reason}`);
+  return outcome;
 }
 
-/** Rebalance tracked panes as a separate failure-isolated transition. */
-export function layoutSurfaces(): void {
-  rebalanceSurfaces();
+/** Rebalance known owned panes as a separate failure-isolated lifecycle action. */
+export async function layoutSurfaces(signal?: AbortSignal): Promise<PaneLayoutOutcome> {
+  const outcome = await paneLayoutCoordinator().reconcile(signal);
+  if (outcome.state === "failed" || outcome.state === "cancelled") throw new Error(`Herdr pane layout failed: ${outcome.reason}`);
+  return outcome;
 }
 
 // ── Exit polling ──

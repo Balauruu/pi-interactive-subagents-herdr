@@ -161,4 +161,35 @@ describe("fault-isolated lifecycle settlement", () => {
       assert.equal(deliveries, 12);
     });
   });
+
+  it("keeps terminal evidence, delivery, release, and cleanup durable when layout fails, then retries layout", async () => {
+    await withRoot(async (artifactDir) => {
+      const run = admit(artifactDir, "layout-timeout");
+      persistLifecycleTerminal(run, EVIDENCE);
+      const persistedEvidence = evidenceBytes(run);
+      let deliveries = 0;
+      let cleanups = 0;
+      let layouts = 0;
+
+      await settleLifecycleRun(run, {
+        delivery: () => { deliveries++; },
+        cleanup: () => { cleanups++; },
+        layout: () => { layouts++; throw Object.assign(new Error("Herdr timeout"), { code: "ETIMEDOUT" }); },
+      });
+      let record = run.coordinator.inspect().children["layout-timeout"]!;
+      assert.equal(evidenceBytes(run), persistedEvidence);
+      assert.equal(record.lease.state, "released");
+      assert.equal(record.transitions.delivery.status, "complete");
+      assert.equal(record.transitions.cleanup.status, "complete");
+      assert.equal(record.transitions.layout.status, "pending");
+      assert.equal(record.transitions.layout.attempts, 1);
+      assert.deepEqual({ deliveries, cleanups, layouts }, { deliveries: 1, cleanups: 1, layouts: 1 });
+
+      await settleLifecycleRun(run, { layout: () => { layouts++; } });
+      record = run.coordinator.inspect().children["layout-timeout"]!;
+      assert.equal(record.transitions.layout.status, "complete");
+      assert.equal(record.transitions.layout.attempts, 2);
+      assert.equal(layouts, 2);
+    });
+  });
 });
