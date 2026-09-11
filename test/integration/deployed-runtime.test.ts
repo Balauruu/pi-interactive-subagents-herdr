@@ -160,7 +160,7 @@ if (liveTestPreflight.status === "disabled") {
         `Call it with name "Denied-${id}", agent "test-echo", and task "echo DENIED_${id} > '${extraFile}'".`,
         `Do not retry it or make any other tool call in this turn.`,
       ].join(" "));
-      await waitForScreen(parentPaneId, /root-tree admission\s+capacity is exhausted/, PI_TIMEOUT, 240);
+      await waitForScreen(parentPaneId, /root-tree\s+admission\s+capacity\s+is\s+exhausted/, PI_TIMEOUT, 240);
       assert.equal(existsSync(extraFile), false, "cap+1 must not write a marker while the configured active slots are occupied");
       assert.deepEqual(
         new Set(readPaneLayout(parentPaneId).panes.map((pane) => pane.paneId)),
