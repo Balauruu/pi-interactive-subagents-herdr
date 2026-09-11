@@ -19,7 +19,7 @@ class DeployError extends Error {
   }
 }
 
-type Options = { settings: string; repo: string; rollback: string; expect?: string };
+type Options = { settings: string; repo: string; rollback: string; expect?: string; replaceRollback?: boolean };
 type RollbackState = {
   version: 1;
   previousPackage: string;
@@ -162,7 +162,11 @@ export function writeJsonAtomically(path: string, value: unknown): void {
     renameSync(temp, target);
   } finally {
     if (fd !== undefined) closeSync(fd);
-    rmSync(temp, { force: true });
+    // A committed rename is the durability boundary. Temporary-file cleanup is
+    // best effort and must not report a committed write as failed.
+    try {
+      rmSync(temp, { force: true });
+    } catch {}
   }
 }
 
@@ -186,7 +190,14 @@ export function applyDeployment(options: Options, atomicWrite: AtomicWriter = wr
   const current = packageEntry(settings, "settings");
   if (current.value !== `${PACKAGE_PREFIX}${options.expect}`) fail("compare-and-swap", "observed settings package ref does not match --expect");
   if (current.value === candidate.packageRef) fail("compare-and-swap", "candidate package ref is already active");
-  if (existsSync(options.rollback)) fail("rollback", "rollback metadata already exists and will not be overwritten");
+  let existingRollback: RollbackState | undefined;
+  if (existsSync(options.rollback)) {
+    if (!options.replaceRollback) fail("rollback", "rollback metadata already exists and will not be overwritten");
+    existingRollback = validateRollback(readJson(options.rollback, "rollback"));
+    if (existingRollback.candidatePackage !== current.value) {
+      fail("compare-and-swap", "existing rollback candidate is no longer the active settings package ref");
+    }
+  }
   const rollback: RollbackState = {
     version: 1,
     previousPackage: current.value,
@@ -195,7 +206,17 @@ export function applyDeployment(options: Options, atomicWrite: AtomicWriter = wr
     candidateRemote: candidate.remote,
   };
   writeForPhase("rollback-write", options.rollback, rollback, atomicWrite);
-  writeForPhase("settings-write", options.settings, replacementSettings(settings, current, candidate.packageRef), atomicWrite);
+  try {
+    writeForPhase("settings-write", options.settings, replacementSettings(settings, current, candidate.packageRef), atomicWrite);
+  } catch (error) {
+    try {
+      if (existingRollback) writeForPhase("rollback-recovery", options.rollback, existingRollback, atomicWrite);
+      else rmSync(options.rollback, { force: true });
+    } catch (recoveryError) {
+      fail("rollback-recovery", `settings write failed and rollback restoration failed: ${(recoveryError as Error).message}`);
+    }
+    throw error;
+  }
   return { settingsPath: options.settings, previousPackage: current.value, candidatePackage: candidate.packageRef };
 }
 
@@ -237,6 +258,11 @@ function parseArguments(argv: string[]): { mode: "apply" | "verify" | "rollback"
       rollbackMode = token === "--check" ? "check" : "apply";
       continue;
     }
+    if (token === "--replace-rollback") {
+      if (mode !== "apply" || values.replaceRollback) fail("arguments", "--replace-rollback is only valid once with apply");
+      values.replaceRollback = true;
+      continue;
+    }
     if (token === "--settings" || token === "--repo" || token === "--rollback" || token === "--expect") {
       const key = token.slice(2) as keyof Options;
       const value = rest[++index];
@@ -248,8 +274,18 @@ function parseArguments(argv: string[]): { mode: "apply" | "verify" | "rollback"
   }
   if (!values.settings || !values.repo || !values.rollback) fail("arguments", "--settings, --repo, and --rollback are required");
   if (mode === "rollback" && !rollbackMode) fail("arguments", "rollback requires --check or --apply");
-  if (mode !== "apply" && values.expect) fail("arguments", "--expect is only valid with apply");
-  return { mode, rollbackMode, options: { settings: resolve(values.settings), repo: resolve(values.repo), rollback: resolve(values.rollback), expect: values.expect } };
+  if (mode !== "apply" && (values.expect || values.replaceRollback)) fail("arguments", "--expect and --replace-rollback are only valid with apply");
+  return {
+    mode,
+    rollbackMode,
+    options: {
+      settings: resolve(values.settings),
+      repo: resolve(values.repo),
+      rollback: resolve(values.rollback),
+      expect: values.expect,
+      replaceRollback: values.replaceRollback,
+    },
+  };
 }
 
 export function main(argv = process.argv.slice(2)): void {

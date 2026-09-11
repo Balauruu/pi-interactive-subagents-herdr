@@ -104,6 +104,87 @@ test("rejects missing or duplicate package ownership without mutation", () => {
   }
 });
 
+test("replaces rollback metadata only with an explicit current-candidate compare-and-swap", () => {
+  const value = fixture();
+  try {
+    const first = command(["apply", "--settings", value.settings, "--repo", value.repo, "--rollback", value.rollback, "--expect", OLD_COMMIT]);
+    assert.equal(first.status, 0, output(first));
+
+    writeFileSync(join(value.repo, "recovery-candidate.txt"), "recovery candidate\n");
+    git(value.repo, ["add", "recovery-candidate.txt"]);
+    git(value.repo, ["commit", "--quiet", "-m", "recovery candidate"]);
+    const nextHead = git(value.repo, ["rev-parse", "HEAD"]);
+    const originalRollback = readFileSync(value.rollback, "utf8");
+    writeFileSync(value.rollback, JSON.stringify({
+      version: 1,
+      previousPackage: value.oldRef,
+      candidatePackage: `${PREFIX}${"3".repeat(40)}`,
+      candidateCommit: "3".repeat(40),
+      candidateRemote: REPOSITORY,
+    }));
+    assertFailure(
+      command([
+        "apply", "--settings", value.settings, "--repo", value.repo, "--rollback", value.rollback,
+        "--expect", value.head, "--replace-rollback",
+      ]),
+      "compare-and-swap",
+    );
+    writeFileSync(value.rollback, originalRollback);
+
+    assertFailure(
+      command(["apply", "--settings", value.settings, "--repo", value.repo, "--rollback", value.rollback, "--expect", value.head]),
+      "rollback",
+    );
+    const replaced = command([
+      "apply", "--settings", value.settings, "--repo", value.repo, "--rollback", value.rollback,
+      "--expect", value.head, "--replace-rollback",
+    ]);
+    assert.equal(replaced.status, 0, output(replaced));
+
+    const settings = JSON.parse(readFileSync(value.settings, "utf8"));
+    assert.equal(settings.packages[1], `${PREFIX}${nextHead}`);
+    const metadata = JSON.parse(readFileSync(value.rollback, "utf8"));
+    assert.equal(metadata.previousPackage, `${PREFIX}${value.head}`);
+    assert.equal(metadata.candidatePackage, `${PREFIX}${nextHead}`);
+  } finally {
+    cleanup(value);
+  }
+});
+
+test("restores prior rollback metadata when a replacement settings write fails", () => {
+  const value = fixture();
+  try {
+    assert.equal(command(["apply", "--settings", value.settings, "--repo", value.repo, "--rollback", value.rollback, "--expect", OLD_COMMIT]).status, 0);
+    writeFileSync(join(value.repo, "recovery-failure-candidate.txt"), "recovery failure candidate\n");
+    git(value.repo, ["add", "recovery-failure-candidate.txt"]);
+    git(value.repo, ["commit", "--quiet", "-m", "recovery failure candidate"]);
+    const originalSettings = readFileSync(value.settings, "utf8");
+    const originalRollback = JSON.parse(readFileSync(value.rollback, "utf8"));
+    let calls = 0;
+    assert.throws(
+      () => applyDeployment({
+        settings: value.settings,
+        repo: value.repo,
+        rollback: value.rollback,
+        expect: value.head,
+        replaceRollback: true,
+      }, (path, json) => {
+        calls += 1;
+        if (calls === 2) throw new Error("injected replacement settings write failure");
+        writeJsonAtomically(path, json);
+      }),
+      (error: unknown) => error instanceof Error
+        && (error as Error & { phase?: string }).phase === "settings-write"
+        && /atomic write failed.*injected replacement settings write failure/.test(error.message),
+    );
+    assert.equal(calls, 3);
+    assert.equal(readFileSync(value.settings, "utf8"), originalSettings);
+    assert.deepEqual(JSON.parse(readFileSync(value.rollback, "utf8")), originalRollback);
+  } finally {
+    cleanup(value);
+  }
+});
+
 test("rejects malformed refs, stale old pins, and a candidate that is already active", () => {
   const value = fixture();
   try {
@@ -167,8 +248,7 @@ test("an interrupted second atomic write leaves the active settings byte-for-byt
       && /atomic write failed.*injected settings rename failure/.test(error.message));
     assert.equal(calls, 2);
     assert.equal(readFileSync(value.settings, "utf8"), originalSettings);
-    assert.equal(existsSync(value.rollback), true);
-    assert.equal(JSON.parse(readFileSync(value.rollback, "utf8")).previousPackage, value.oldRef);
+    assert.equal(existsSync(value.rollback), false);
   } finally {
     cleanup(value);
   }
