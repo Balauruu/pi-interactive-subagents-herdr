@@ -50,8 +50,8 @@ for (const backend of backends) {
       env = createTestEnv();
     });
 
-    after(() => {
-      cleanupTestEnv(env);
+    after(async () => {
+      await cleanupTestEnv(env);
     });
 
     // ── Basic spawn + completion ──
@@ -61,7 +61,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `echo-${id}`);
+      const surface = await createTrackedSurface(env, `echo-${id}`);
       await sleep(1000);
 
       const task = [
@@ -113,7 +113,7 @@ for (const backend of backends) {
       trackTempFile(env, startFile);
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `status-${id}`);
+      const surface = await createTrackedSurface(env, `status-${id}`);
       await sleep(1000);
 
       const task = [
@@ -158,7 +158,7 @@ for (const backend of backends) {
       trackTempFile(env, fileA);
       trackTempFile(env, fileB);
 
-      const surface = createTrackedSurface(env, `parallel-${id}`);
+      const surface = await createTrackedSurface(env, `parallel-${id}`);
       await sleep(1000);
 
       const task = [
@@ -196,7 +196,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-fork-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `fork-${id}`);
+      const surface = await createTrackedSurface(env, `fork-${id}`);
       await sleep(1000);
 
       const task = [
@@ -244,7 +244,7 @@ for (const backend of backends) {
     it("subagent caller_ping sends notification back to the parent", async () => {
       const id = uniqueId();
 
-      const surface = createTrackedSurface(env, `ping-${id}`);
+      const surface = await createTrackedSurface(env, `ping-${id}`);
       await sleep(1000);
 
       const task = [
@@ -278,7 +278,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `discovery-${id}`);
+      const surface = await createTrackedSurface(env, `discovery-${id}`);
       await sleep(1000);
 
       // Use subagents_list to verify test agents are discoverable,
@@ -306,7 +306,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `sysprompt-${id}`);
+      const surface = await createTrackedSurface(env, `sysprompt-${id}`);
       await sleep(1000);
 
       const task = [

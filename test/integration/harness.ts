@@ -33,6 +33,7 @@ import {
   closeSurface,
   shellEscape,
 } from "../../pi-extension/subagents/herdr.ts";
+import { parseHerdrPaneLayout, type HerdrPaneLayout } from "../../pi-extension/subagents/pane-layout.ts";
 
 // Re-export Herdr surface primitives for tests
 export {
@@ -82,7 +83,7 @@ export function getAvailableBackends(): string[] {
 
 export function getFocusedSurface(): string | null {
   try {
-    const response = JSON.parse(execFileSync("herdr", ["pane", "current"], { encoding: "utf8" }));
+    const response = JSON.parse(execFileSync("herdr", ["pane", "current", "--current"], { encoding: "utf8" }));
     return response.result?.pane?.pane_id ?? null;
   } catch {
     return null;
@@ -124,10 +125,10 @@ export function createTestEnv(): TestEnv {
 /**
  * Clean up all resources created during the test.
  */
-export function cleanupTestEnv(env: TestEnv): void {
+export async function cleanupTestEnv(env: TestEnv): Promise<void> {
   for (const surface of env.surfaces) {
     try {
-      closeSurface(surface);
+      await closeSurface(surface);
     } catch {}
   }
   for (const file of env.tempFiles) {
@@ -143,19 +144,19 @@ export function cleanupTestEnv(env: TestEnv): void {
 /**
  * Create a surface and register it for automatic cleanup.
  */
-export function createTrackedSurface(env: TestEnv, name: string): string {
-  const surface = createSurface(name);
+export async function createTrackedSurface(env: TestEnv, name: string): Promise<string> {
+  const surface = await createSurface(name);
   env.surfaces.push(surface);
   return surface;
 }
 
-export function createTrackedSurfaceSplit(
+export async function createTrackedSurfaceSplit(
   env: TestEnv,
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
-): string {
-  const surface = createSurfaceSplit(name, direction, fromSurface);
+): Promise<string> {
+  const surface = await createSurfaceSplit(name, direction, fromSurface);
   env.surfaces.push(surface);
   return surface;
 }
@@ -165,6 +166,76 @@ export function createTrackedSurfaceSplit(
  */
 export function untrackSurface(env: TestEnv, surface: string): void {
   env.surfaces = env.surfaces.filter((s) => s !== surface);
+}
+
+// ── Pane-only layout workspace ──
+
+const HERDR_COMMAND_TIMEOUT = 5_000;
+
+export interface PaneLayoutWorkspace {
+  workspaceId: string;
+  rootPaneId: string;
+  dir: string;
+}
+
+/**
+ * Real layout tests are opt-in and require Herdr's caller context. They never
+ * start pi or invoke a provider, so the supplied model environment is ignored.
+ */
+export function isPaneLayoutIntegrationAvailable(): boolean {
+  return process.env.PI_LIVE_TESTS === "1" && process.env.HERDR_ENV === "1" && isMuxAvailable();
+}
+
+function herdrJson(args: string[]): unknown {
+  let stdout: string;
+  try {
+    stdout = execFileSync("herdr", args, { encoding: "utf8", timeout: HERDR_COMMAND_TIMEOUT });
+  } catch {
+    throw new Error(`Herdr ${args.slice(0, 2).join(" ")} command failed`);
+  }
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new Error(`Herdr ${args.slice(0, 2).join(" ")} returned invalid JSON`);
+  }
+}
+
+function requiredId(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`Herdr ${label} was missing`);
+  return value;
+}
+
+/** Create a no-focus Herdr workspace rooted in a unique temporary directory. */
+export function createPaneLayoutWorkspace(label: string): PaneLayoutWorkspace {
+  const dir = mkdtempSync(join(tmpdir(), "pi-herdr-layout-"));
+  try {
+    const response = herdrJson(["workspace", "create", "--cwd", dir, "--label", label, "--no-focus"]);
+    const result = (response as { result?: { workspace?: { workspace_id?: unknown }; root_pane?: { pane_id?: unknown } } }).result;
+    return {
+      workspaceId: requiredId(result?.workspace?.workspace_id, "workspace id"),
+      rootPaneId: requiredId(result?.root_pane?.pane_id, "root pane id"),
+      dir,
+    };
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/** Parse only validated rectangle data; raw Herdr command output is not retained. */
+export function readPaneLayout(rootPaneId: string): HerdrPaneLayout {
+  const parsed = parseHerdrPaneLayout(herdrJson(["pane", "layout", "--pane", rootPaneId]));
+  if (!parsed.ok) throw new Error(`Herdr returned ${parsed.reason} layout data`);
+  return parsed.layout;
+}
+
+/** Always remove the workspace and its temporary directory, even after a failed assertion. */
+export function cleanupPaneLayoutWorkspace(workspace: PaneLayoutWorkspace): void {
+  try {
+    herdrJson(["workspace", "close", workspace.workspaceId]);
+  } finally {
+    rmSync(workspace.dir, { recursive: true, force: true });
+  }
 }
 
 // ── Pi session management ──

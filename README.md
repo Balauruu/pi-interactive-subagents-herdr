@@ -6,7 +6,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own Herdr pane without stealing keyboard focus. The first three agent panes form columns to the right of the parent Pi pane; additional agents are distributed vertically across those columns. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own Herdr pane without stealing keyboard focus. A root-scoped coordinator selects safe split sources and bounded rebalancing from the current proven pane geometry. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Herdr owns pane layout and focus. The extension submits commands atomically through Herdr and reads the pane's detected terminal output. Up to three right-hand agent columns are rebalanced after each spawn or cleanup. Additional agents split downward from the shortest column. If the terminal is too narrow for equal columns, the main Pi pane keeps the larger share and the remaining space is divided between agent columns. Set `PI_SUBAGENT_MIN_PANE_WIDTH` to change the width threshold; it defaults to `24` columns.
+Herdr owns pane layout and focus. The extension submits commands atomically through Herdr and reads the pane's detected terminal output. Each root-scoped coordinator trusts only its original root pane and child IDs returned by its own successful splits. It selects the largest proven pane and its longest usable axis, then performs at most one bounded reconciliation pass. It never changes a foreign, stale, or unproven pane.
 
 ## Root-tree lifecycle and recovery
 
@@ -33,6 +33,20 @@ Settlement independently claims `extraction`, `delivery`, `release`, `cleanup`, 
 2. If terminal evidence exists and the lease is still active, resume settlement from the proven owner. It will retry pending release, cleanup, and layout actions independently without replacing terminal evidence.
 3. Do not delete a lock or close a pane when ownership cannot be proven. A malformed state, contended lock, unknown owner, or lease-token mismatch is intentionally left inspectable rather than speculatively recovered.
 4. A delivery transition that exhausted its retry boundary records a redacted failure instead of sending the terminal result again. Resolve it through the parent/session recovery path, then inspect the durable evidence reference.
+
+## Pane layout verification
+
+A reconciliation returns only a structured, redacted outcome: root ID, owned-pane count, operation count, state, and stable reason. It does not retain raw Herdr output. The coordinator uses argv-based `execFile` calls, a three-second command timeout, `AbortSignal` propagation, root-scoped reconciliation coalescing, and a fixed eight-operation budget. Split failure rejects a launch. Layout or cleanup failure remains a separately recorded retryable lifecycle action and never blocks evidence delivery or admission release.
+
+The provider-free real-CLI suite creates a unique no-focus Herdr workspace rooted in a temporary directory, performs split, layout, bounded resize, and owned close operations, then closes the workspace and removes that directory in `finally` cleanup. It verifies that the caller pane remains unchanged and accepts a minimum pane-area ratio of `0.60` as reasonably symmetric after representative spawn and cleanup sequences. This permits Herdr's single bounded fractional correction while rejecting an unchanged 1:2 split.
+
+Run the real workspace suite only from a Herdr-managed pane:
+
+```bash
+PI_LIVE_TESTS=1 PI_TEST_MODEL=anthropic/claude-haiku-4-5 npm run test:layout:integration
+```
+
+`PI_TEST_MODEL` is accepted by the shared integration environment but this pane-only suite does not start Pi or invoke a provider. Outside a Herdr caller context it reports a skipped test rather than controlling a focused session. `npm test` remains the offline verification for the planner and failure/cancellation paths. S05 owns broader diagnostics, offline regressions, and guarded authorized live tests. S06 owns verification of the active deployed artifact and the complete real child/pane lifecycle.
 
 ## Tools
 
