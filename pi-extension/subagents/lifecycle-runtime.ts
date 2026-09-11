@@ -2,6 +2,7 @@ import {
   deriveRootTreeId,
   LifecycleError,
   RootTreeLifecycleCoordinator,
+  type ExhaustedFailureDiagnostic,
   type LifecycleLease,
   type TerminalEvidence,
 } from "./lifecycle.ts";
@@ -26,6 +27,8 @@ export interface SettlementActions {
   layout?: () => void | Promise<void>;
   /** A parent-visible terminal notice, independently deduped from result delivery. */
   notification?: () => void | Promise<void>;
+  /** Claimed safe diagnostics. A throwing callback becomes ambiguous and is not replayed. */
+  failureNotice?: (diagnostics: ExhaustedFailureDiagnostic[]) => void | Promise<void>;
 }
 
 function safeError(error: unknown): string {
@@ -142,6 +145,26 @@ export async function settleLifecycleRun(run: LifecycleRun, actions: SettlementA
   await independentlySettle(run, "cleanup", actions.cleanup);
   await independentlySettle(run, "layout", actions.layout);
   await independentlySettle(run, "notification", actions.notification);
+
+  // Claim only after all independent transitions settle. Claim-before-delivery
+  // fences duplicate parent notices after callback failures or process restart.
+  if (actions.failureNotice) {
+    let diagnostics: ExhaustedFailureDiagnostic[] = [];
+    try {
+      diagnostics = run.coordinator.claimExhaustedFailureDiagnostics({ ownerId: run.ownerId });
+      if (diagnostics.length > 0) await actions.failureNotice(diagnostics);
+    } catch {
+      // A callback may have delivered before it threw. Fence its already-claimed
+      // notices as ambiguous and never replay them; failure here is secondary.
+      try {
+        if (diagnostics.length > 0) {
+          run.coordinator.markFailureNoticeAmbiguous({ ownerId: run.ownerId, diagnostics });
+        }
+      } catch {
+        // Diagnostics cannot block durable evidence, lease release, cleanup, or layout.
+      }
+    }
+  }
 }
 
 /** Pre-launch failures become cancellation evidence and still release their admission slot. */

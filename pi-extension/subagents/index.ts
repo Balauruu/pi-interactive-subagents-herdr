@@ -85,6 +85,31 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const STATUS_NOTIFICATION_LINE_LIMIT = 4;
+
+function formatExhaustedFailureLine(diagnostic: {
+  childId: string;
+  transition: string;
+  category: string;
+  attempts: number;
+}): string {
+  return `[${diagnostic.childId}] ${diagnostic.transition} exhausted after ${diagnostic.attempts} attempts (${diagnostic.category}). Failure details redacted.`;
+}
+
+function deliverExhaustedFailureStatus(diagnostics: Parameters<NonNullable<import("./lifecycle-runtime.ts").SettlementActions["failureNotice"]>>[0]): void {
+  if (!latestPi || diagnostics.length === 0) return;
+  const lines = diagnostics.map(formatExhaustedFailureLine);
+  const capped = capStatusLines(lines, STATUS_NOTIFICATION_LINE_LIMIT);
+  latestPi.sendMessage(
+    {
+      customType: "subagent_status",
+      content: formatStatusAggregate(lines, STATUS_NOTIFICATION_LINE_LIMIT),
+      display: true,
+      details: { lines: capped.visibleLines, overflow: capped.overflow, exhausted: true },
+    },
+    // Terminal result delivery owns the parent turn. Visibility must not wake it again.
+    { triggerTurn: false, deliverAs: "steer" },
+  );
+}
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 
 {
@@ -1738,7 +1763,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      if (lifecycle) await settleLifecycleRun(lifecycle, { cleanup: () => closeSurface(surface), layout: layoutSurfaces });
+      if (lifecycle) await settleLifecycleRun(lifecycle, { cleanup: () => closeSurface(surface), layout: layoutSurfaces, failureNotice: deliverExhaustedFailureStatus });
       else {
         await closeSurface(surface);
         await layoutSurfaces();
@@ -1772,7 +1797,7 @@ async function watchSubagent(
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
     if (lifecycle) {
-      await settleLifecycleRun(lifecycle, { cleanup: () => closeSurface(surface), layout: layoutSurfaces });
+      await settleLifecycleRun(lifecycle, { cleanup: () => closeSurface(surface), layout: layoutSurfaces, failureNotice: deliverExhaustedFailureStatus });
       lifecycleRuns.delete(running.id);
     } else {
       await closeSurface(surface);
@@ -1794,7 +1819,7 @@ async function watchSubagent(
   } catch (err: any) {
     try {
       if (lifecycle) {
-        await settleLifecycleRun(lifecycle, { cleanup: () => closeSurface(surface), layout: layoutSurfaces });
+        await settleLifecycleRun(lifecycle, { cleanup: () => closeSurface(surface), layout: layoutSurfaces, failureNotice: deliverExhaustedFailureStatus });
         lifecycleRuns.delete(running.id);
       } else {
         await closeSurface(surface);

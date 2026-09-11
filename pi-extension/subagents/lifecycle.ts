@@ -11,8 +11,11 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-const STATE_VERSION = 2;
+const STATE_VERSION = 3;
+const PREVIOUS_STATE_VERSION = 2;
 const LEGACY_STATE_VERSION = 1;
+const FAILURE_DIAGNOSTIC_MESSAGE = "Failure details redacted.";
+export const FAILURE_DIAGNOSTIC_LIMIT = 12;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const PHASES = ["starting", "running", "waiting", "interactive", "terminal", "cancelled"] as const;
 const ACTIVE_PHASES = ["starting", "running", "waiting", "interactive"] as const;
@@ -74,6 +77,31 @@ export interface LifecycleLease {
   releasedAt: string | null;
 }
 
+interface FailureNoticeClaim {
+  status: "pending" | "claimed" | "ambiguous";
+  ownerId: string | null;
+  claimedAt: string | null;
+}
+
+interface PersistedFailureDiagnostic {
+  category: FailureDiagnosticCategory;
+  occurredAt: string;
+  message: string;
+}
+
+export type FailureDiagnosticCategory = "timeout" | "cancelled" | "provider" | "subprocess" | "lifecycle";
+
+/** Safe, bounded facts for a failed transition. Never includes child inputs or provider output. */
+export interface ExhaustedFailureDiagnostic {
+  childId: string;
+  transition: TransitionName;
+  state: "exhausted";
+  category: FailureDiagnosticCategory;
+  attempts: number;
+  occurredAt: string;
+  message: string;
+}
+
 interface LifecycleTransition {
   status: TransitionStatus;
   ownerId: string | null;
@@ -81,6 +109,8 @@ interface LifecycleTransition {
   claimedAt: string | null;
   completedAt: string | null;
   lastError: string | null;
+  failureDiagnostic: PersistedFailureDiagnostic | null;
+  failureNotice: FailureNoticeClaim;
 }
 
 export interface ChildLifecycleRecord {
@@ -175,11 +205,24 @@ function sameTerminalEvidence(left: TerminalEvidence, right: TerminalEvidence): 
   );
 }
 
+function newFailureNotice(): FailureNoticeClaim {
+  return { status: "pending", ownerId: null, claimedAt: null };
+}
+
 function newTransitions(): Record<TransitionName, LifecycleTransition> {
   return Object.fromEntries(
     TRANSITIONS.map((transition) => [
       transition,
-      { status: "pending", ownerId: null, attempts: 0, claimedAt: null, completedAt: null, lastError: null },
+      {
+        status: "pending",
+        ownerId: null,
+        attempts: 0,
+        claimedAt: null,
+        completedAt: null,
+        lastError: null,
+        failureDiagnostic: null,
+        failureNotice: newFailureNotice(),
+      },
     ]),
   ) as Record<TransitionName, LifecycleTransition>;
 }
@@ -196,6 +239,24 @@ function validActivePhase(value: unknown): value is ActiveLifecyclePhase {
   return typeof value === "string" && (ACTIVE_PHASES as readonly string[]).includes(value);
 }
 
+function isFailureNoticeClaim(value: unknown): value is FailureNoticeClaim {
+  return (
+    isRecord(value) &&
+    (value.status === "pending" || value.status === "claimed" || value.status === "ambiguous") &&
+    (value.ownerId === null || assertIdentifierForSchema(value.ownerId)) &&
+    (value.claimedAt === null || isTimestamp(value.claimedAt))
+  );
+}
+
+function isPersistedFailureDiagnostic(value: unknown): value is PersistedFailureDiagnostic {
+  return (
+    isRecord(value) &&
+    (value.category === "timeout" || value.category === "cancelled" || value.category === "provider" || value.category === "subprocess" || value.category === "lifecycle") &&
+    isTimestamp(value.occurredAt) &&
+    value.message === FAILURE_DIAGNOSTIC_MESSAGE
+  );
+}
+
 function isLifecycleTransition(value: unknown): value is LifecycleTransition {
   return (
     isRecord(value) &&
@@ -204,7 +265,9 @@ function isLifecycleTransition(value: unknown): value is LifecycleTransition {
     typeof value.attempts === "number" && Number.isInteger(value.attempts) && value.attempts >= 0 &&
     (value.claimedAt === null || isTimestamp(value.claimedAt)) &&
     (value.completedAt === null || isTimestamp(value.completedAt)) &&
-    (value.lastError === null || isShortText(value.lastError))
+    (value.lastError === null || isShortText(value.lastError)) &&
+    (value.failureDiagnostic === null || isPersistedFailureDiagnostic(value.failureDiagnostic)) &&
+    isFailureNoticeClaim(value.failureNotice)
   );
 }
 
@@ -240,21 +303,56 @@ function isLifecycleState(value: unknown): value is RootTreeLifecycleState {
   return Object.entries(value.children).every(([childId, child]) => assertIdentifierForSchema(childId) && isChildRecord(child, childId));
 }
 
-/** Add the independent notification transition to valid v1 state before use. */
+function failureCategory(error: string): FailureDiagnosticCategory {
+  const normalized = error.toLowerCase();
+  if (/timeout|timed out|etimedout/.test(normalized)) return "timeout";
+  if (/cancel|abort/.test(normalized)) return "cancelled";
+  if (/provider|model|api/.test(normalized)) return "provider";
+  if (/exit|spawn|process|pane/.test(normalized)) return "subprocess";
+  return "lifecycle";
+}
+
+function safeFailureDiagnostic(error: string, occurredAt: string): PersistedFailureDiagnostic {
+  return { category: failureCategory(error), occurredAt, message: FAILURE_DIAGNOSTIC_MESSAGE };
+}
+
+function upgradeTransition(value: unknown, occurredAt: string): LifecycleTransition | null {
+  if (!isRecord(value) || typeof value.lastError !== "string" && value.lastError !== null) return null;
+  const lastError = value.lastError;
+  return {
+    status: value.status as TransitionStatus,
+    ownerId: typeof value.ownerId === "string" ? value.ownerId : null,
+    attempts: value.attempts as number,
+    claimedAt: typeof value.claimedAt === "string" ? value.claimedAt : null,
+    completedAt: typeof value.completedAt === "string" ? value.completedAt : null,
+    lastError,
+    failureDiagnostic: lastError === null ? null : safeFailureDiagnostic(lastError, occurredAt),
+    // v2 retained the transition claimant after a failed completion, which is
+    // the only safe owner binding available when projecting its exhausted work.
+    failureNotice: {
+      status: "pending",
+      ownerId: typeof value.ownerId === "string" && assertIdentifierForSchema(value.ownerId) ? value.ownerId : null,
+      claimedAt: null,
+    },
+  };
+}
+
+/** Migrate every previously supported root snapshot to the safe v3 notice schema. */
 function migrateLegacyState(value: unknown): unknown {
-  if (!isRecord(value) || value.version !== LEGACY_STATE_VERSION || !isRecord(value.children)) return value;
+  if (!isRecord(value) || !isRecord(value.children) || (value.version !== LEGACY_STATE_VERSION && value.version !== PREVIOUS_STATE_VERSION)) return value;
   const upgraded = clone(value) as Record<string, unknown>;
   const children = upgraded.children as Record<string, unknown>;
   for (const child of Object.values(children)) {
-    if (!isRecord(child) || !isRecord(child.transitions) || child.transitions.notification !== undefined) return value;
-    child.transitions.notification = {
-      status: "pending",
-      ownerId: null,
-      attempts: 0,
-      claimedAt: null,
-      completedAt: null,
-      lastError: null,
-    };
+    if (!isRecord(child) || !isRecord(child.transitions) || !isTimestamp(child.updatedAt)) return value;
+    if (value.version === LEGACY_STATE_VERSION) {
+      if (child.transitions.notification !== undefined) return value;
+      child.transitions.notification = { status: "pending", ownerId: null, attempts: 0, claimedAt: null, completedAt: null, lastError: null };
+    }
+    for (const name of TRANSITIONS) {
+      const upgradedTransition = upgradeTransition(child.transitions[name], child.updatedAt);
+      if (!upgradedTransition) return value;
+      child.transitions[name] = upgradedTransition;
+    }
   }
   upgraded.version = STATE_VERSION;
   return upgraded;
@@ -421,8 +519,12 @@ export class RootTreeLifecycleCoordinator {
       if (transition.status !== "claimed") throw new LifecycleError("transition-not-claimed", "transition must be claimed before completion");
       if (transition.ownerId !== params.ownerId) throw new LifecycleError("transition-owned", "transition is claimed by another owner");
       if (params.error !== undefined) {
+        const occurredAt = this.timestamp();
+        const diagnostic = safeFailureDiagnostic(params.error, occurredAt);
         transition.status = "pending";
         transition.lastError = params.error;
+        transition.failureDiagnostic = diagnostic;
+        transition.failureNotice = { status: "pending", ownerId: params.ownerId, claimedAt: null };
         child.lastTransitionError = `${params.transition}: ${params.error}`;
         this.touch(state, child);
         return { changed: true, result: { completed: false, attempts: transition.attempts } };
@@ -430,6 +532,8 @@ export class RootTreeLifecycleCoordinator {
       transition.status = "complete";
       transition.completedAt = this.timestamp();
       transition.lastError = null;
+      transition.failureDiagnostic = null;
+      transition.failureNotice = newFailureNotice();
       this.touch(state, child);
       return { changed: true, result: { completed: true, attempts: transition.attempts } };
     });
@@ -452,9 +556,12 @@ export class RootTreeLifecycleCoordinator {
       if (transition.status === "ambiguous") return { changed: false, result: { fenced: false, attempts: transition.attempts } };
       if (transition.status !== "claimed") throw new LifecycleError("transition-not-claimed", "transition must be claimed before fencing");
       if (transition.ownerId !== params.ownerId) throw new LifecycleError("transition-owned", "transition is claimed by another owner");
+      const diagnostic = safeFailureDiagnostic(params.error, this.timestamp());
       transition.status = "ambiguous";
       transition.completedAt = this.timestamp();
       transition.lastError = params.error;
+      transition.failureDiagnostic = null;
+      transition.failureNotice = { status: "ambiguous", ownerId: params.ownerId, claimedAt: this.timestamp() };
       child.lastTransitionError = `${params.transition}: ${params.error}`;
       this.touch(state, child);
       return { changed: true, result: { fenced: true, attempts: transition.attempts } };
@@ -475,6 +582,78 @@ export class RootTreeLifecycleCoordinator {
       child.lease.releasedAt = this.timestamp();
       this.touch(state, child);
       return { changed: true, result: { released: true, lease: this.publicLease(child) } };
+    });
+  }
+
+  /**
+   * Claim the owner-visible notices for exhausted transitions in this root.
+   * Claiming happens in the same durable mutation as snapshotting, so callers
+   * must treat callback failures as ambiguous and never invoke them again.
+   */
+  claimExhaustedFailureDiagnostics(params: { ownerId: string; limit?: number }): ExhaustedFailureDiagnostic[] {
+    assertIdentifier(params.ownerId, "owner id");
+    const limit = params.limit ?? FAILURE_DIAGNOSTIC_LIMIT;
+    if (!Number.isInteger(limit) || limit < 1 || limit > FAILURE_DIAGNOSTIC_LIMIT) {
+      throw new LifecycleError("invalid-configuration", "failure diagnostic limit is invalid");
+    }
+    return this.mutate((state) => {
+      const diagnostics: ExhaustedFailureDiagnostic[] = [];
+      const claimedAt = this.timestamp();
+      for (const child of Object.values(state.children)) {
+        for (const transitionName of TRANSITIONS) {
+          if (diagnostics.length >= limit) break;
+          const transition = child.transitions[transitionName];
+          const diagnostic = transition.failureDiagnostic;
+          if (
+            transition.attempts < this.maxTransitionAttempts ||
+            transition.status !== "pending" ||
+            transition.failureNotice.status !== "pending" ||
+            transition.failureNotice.ownerId !== params.ownerId ||
+            !diagnostic
+          ) continue;
+          transition.failureNotice = { status: "claimed", ownerId: params.ownerId, claimedAt };
+          diagnostics.push({
+            childId: child.childId,
+            transition: transitionName,
+            state: "exhausted",
+            category: diagnostic.category,
+            attempts: transition.attempts,
+            occurredAt: diagnostic.occurredAt,
+            message: diagnostic.message,
+          });
+        }
+      }
+      if (diagnostics.length === 0) return { changed: false, result: diagnostics };
+      state.updatedAt = claimedAt;
+      return { changed: true, result: diagnostics };
+    });
+  }
+
+  /**
+   * Record a post-invocation delivery failure without reopening a claimed
+   * notice. The callback may have reached its parent before throwing, so this
+   * is intentionally a terminal no-replay state.
+   */
+  markFailureNoticeAmbiguous(params: { ownerId: string; diagnostics: ExhaustedFailureDiagnostic[] }): void {
+    assertIdentifier(params.ownerId, "owner id");
+    if (params.diagnostics.length > FAILURE_DIAGNOSTIC_LIMIT) {
+      throw new LifecycleError("invalid-configuration", "too many failure diagnostics");
+    }
+    this.mutate((state) => {
+      let changed = false;
+      const now = this.timestamp();
+      for (const diagnostic of params.diagnostics) {
+        const child = state.children[diagnostic.childId];
+        if (!child || !validTransition(diagnostic.transition)) continue;
+        const notice = child.transitions[diagnostic.transition].failureNotice;
+        if (notice.status !== "claimed" || notice.ownerId !== params.ownerId) continue;
+        notice.status = "ambiguous";
+        child.updatedAt = now;
+        changed = true;
+      }
+      if (!changed) return { changed: false, result: undefined };
+      state.updatedAt = now;
+      return { changed: true, result: undefined };
     });
   }
 
