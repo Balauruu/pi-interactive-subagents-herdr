@@ -39,14 +39,18 @@ import {
   countSessionEntryLines,
   findLastAssistantMessage,
   getNewEntries,
+  acknowledgeOwnedQuestionEnvelope,
   getSessionId,
+  ownedInteractionEventIds,
   readNameRegistry,
+  readOwnedQuestionEnvelope,
   readSubagentLoadout,
   registerName,
   resolveNameInRegistry,
   seedSubagentSessionFile,
   summarizeSessionStats,
   writeSubagentLoadout,
+  type OwnedSessionBinding,
   type SessionStats,
   type SubagentLoadout,
 } from "./session.ts";
@@ -695,6 +699,8 @@ interface RunningSubagent {
   surface: string;
   startTime: number;
   sessionFile: string;
+  /** Exact parent-local ownership proof used for question acknowledgement. */
+  ownership?: OwnedSessionBinding;
   launchScriptFile?: string;
   activityFile?: string;
   activity?: SubagentActivityState;
@@ -1334,14 +1340,29 @@ async function launchSubagent(
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
-  if (launchBehavior.seededSessionMode) {
-    seedSubagentSessionFile({
-      mode: launchBehavior.seededSessionMode,
-      parentSessionFile: sessionFile,
-      childSessionFile: subagentSessionFile,
-      childCwd: targetCwdForSession,
-    });
-  }
+  // Every child gets a deterministic, parent-addressable header. Standalone
+  // preserves its no-lineage semantics while still supplying an exact handle.
+  seedSubagentSessionFile({
+    mode: launchBehavior.seededSessionMode ?? "standalone",
+    parentSessionFile: sessionFile,
+    childSessionFile: subagentSessionFile,
+    childCwd: targetCwdForSession,
+  });
+  const childSessionId = getSessionId(subagentSessionFile);
+  if (!childSessionId) throw new Error("subagent session header was not created");
+  const ownership: OwnedSessionBinding = {
+    rootId: lifecycle.rootId,
+    parentId: sessionId,
+    parentArtifactDir: artifactDir,
+    childId: lifecycle.childId,
+    ownerId: lifecycle.ownerId,
+    eventIds: ownedInteractionEventIds({
+      rootId: lifecycle.rootId,
+      parentId: sessionId,
+      childId: lifecycle.childId,
+      sessionId: childSessionId,
+    }),
+  };
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
@@ -1421,6 +1442,7 @@ async function launchSubagent(
       surface,
       startTime,
       sessionFile: subagentSessionFile,
+      ownership,
       launchScriptFile,
       cli: "claude",
       sentinelFile,
@@ -1500,6 +1522,11 @@ async function launchSubagent(
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
+  envParts.push(`PI_SUBAGENT_PARENT_ID=${shellEscape(ownership.parentId)}`);
+  envParts.push(`PI_SUBAGENT_CHILD_ID=${shellEscape(ownership.childId)}`);
+  envParts.push(`PI_SUBAGENT_OWNER_ID=${shellEscape(ownership.ownerId)}`);
+  envParts.push(`PI_SUBAGENT_CHILD_SESSION_ID=${shellEscape(childSessionId)}`);
+  envParts.push(`PI_SUBAGENT_QUESTION_EVENT_ID=${shellEscape(ownership.eventIds.questionEventId)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
@@ -1566,6 +1593,7 @@ async function launchSubagent(
     surface,
     startTime,
     sessionFile: subagentSessionFile,
+    ownership,
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
@@ -1613,38 +1641,33 @@ function copyClaudeSession(sentinelFile: string): string | null {
  * delivery so it fires once per question (a subagent may ask again later).
  */
 function deliverPendingQuestion(running: RunningSubagent): void {
-  const askFile = `${running.sessionFile}.ask`;
-  let payload: any = null;
-  try {
-    if (!existsSync(askFile)) return;
-    payload = JSON.parse(readFileSync(askFile, "utf-8"));
-  } catch {
-    // Malformed/partway-written file — drop it and move on.
-  }
-  try {
-    unlinkSync(askFile);
-  } catch {}
-  if (!payload?.question) return;
+  // A question is visible only when this in-memory watcher still carries the
+  // exact parent-local binding persisted at launch. Foreign/malformed sidecars
+  // remain local rather than waking an unrelated parent.
+  const ownership = running.ownership;
+  if (!ownership || !latestPi) return;
+  const payload = readOwnedQuestionEnvelope(running.sessionFile, ownership.eventIds.questionEventId);
+  if (!payload) return;
+  if (
+    payload.rootId !== ownership.rootId || payload.parentId !== ownership.parentId ||
+    payload.childId !== ownership.childId || payload.ownerId !== ownership.ownerId
+  ) return;
 
-  const name = running.name; // unique per session (deduped at spawn) — targets the reply
-  const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
+  const name = running.name;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
-
-  latestPi?.sendMessage(
+  // Persist acknowledgement only after the parent transport returns. A thrown
+  // send leaves the envelope intact for the next bounded watcher tick.
+  latestPi.sendMessage(
     {
       customType: "subagent_question",
       content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
       display: true,
-      details: {
-        name,
-        agent: running.agent,
-        question: payload.question,
-        ...(sessionId ? { sessionId } : {}),
-      },
+      details: { name, agent: running.agent, question: payload.question, sessionId: payload.sessionId },
     },
     { triggerTurn: true, deliverAs: "steer" },
   );
+  acknowledgeOwnedQuestionEnvelope(running.sessionFile, ownership.eventIds.questionEventId);
 }
 
 async function watchSubagent(
@@ -1954,6 +1977,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         registerName(parentArtifactDir, running.name, {
           sessionFile: running.sessionFile,
           sessionId: getSessionId(running.sessionFile),
+          ...(running.ownership ? { ownership: running.ownership } : {}),
         });
 
         // Create a separate AbortController for the watcher

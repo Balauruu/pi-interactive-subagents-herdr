@@ -10,6 +10,7 @@ import {
   readdirSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -32,7 +33,7 @@ export interface MessageEntry extends SessionEntry {
   };
 }
 
-export type SeededSubagentSessionMode = "lineage-only" | "fork";
+export type SeededSubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 function getForkContentLines(parentSessionFile: string): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
@@ -62,7 +63,7 @@ function getForkContentLines(parentSessionFile: string): string[] {
 
 export function seedSubagentSessionFile(params: {
   mode: SeededSubagentSessionMode;
-  parentSessionFile: string;
+  parentSessionFile?: string;
   childSessionFile: string;
   childCwd: string;
 }): void {
@@ -72,10 +73,13 @@ export function seedSubagentSessionFile(params: {
     id: randomUUID(),
     timestamp: new Date().toISOString(),
     cwd: params.childCwd,
-    parentSession: params.parentSessionFile,
+    ...(params.mode === "standalone" ? {} : { parentSession: params.parentSessionFile }),
   };
+  if (params.mode !== "standalone" && !params.parentSessionFile) {
+    throw new LifecycleError("invalid-configuration", "seeded lineage requires a parent session file");
+  }
   const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+    params.mode === "fork" ? getForkContentLines(params.parentSessionFile!) : [];
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
@@ -259,6 +263,84 @@ export function isOwnedEventAcknowledged(value: unknown, expectedEventId: string
     typeof (value as OwnedEventAcknowledgement).acknowledgedAt === "string" &&
     Number.isFinite(Date.parse((value as OwnedEventAcknowledgement).acknowledgedAt)),
   );
+}
+
+/** The question itself remains local to the child sidecar, never the registry or lifecycle diagnostic. */
+export interface OwnedQuestionEnvelope {
+  eventId: string;
+  rootId: string;
+  parentId: string;
+  childId: string;
+  ownerId: string;
+  sessionId: string;
+  question: string;
+}
+
+function isOwnedQuestionEnvelope(value: unknown, expectedEventId?: string): value is OwnedQuestionEnvelope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const envelope = value as OwnedQuestionEnvelope;
+  if (
+    !OWNED_EVENT_ID.test(envelope.eventId) || !isOwnedIdentifier(envelope.rootId) ||
+    !isOwnedIdentifier(envelope.parentId) || !isOwnedIdentifier(envelope.childId) ||
+    !isOwnedIdentifier(envelope.ownerId) || !isOwnedIdentifier(envelope.sessionId) ||
+    typeof envelope.question !== "string" || envelope.question.length === 0 || envelope.question.length > 16_384 ||
+    (expectedEventId !== undefined && envelope.eventId !== expectedEventId)
+  ) return false;
+  try {
+    return envelope.eventId === ownedQuestionEventId({
+      rootId: envelope.rootId,
+      parentId: envelope.parentId,
+      childId: envelope.childId,
+      sessionId: envelope.sessionId,
+    });
+  } catch {
+    return false;
+  }
+}
+
+function writeAtomicJson(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const temporaryPath = `${path}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(value), "utf8");
+    renameSync(temporaryPath, path);
+  } catch (error) {
+    try { unlinkSync(temporaryPath); } catch { /* preserve original write failure */ }
+    throw error;
+  }
+}
+
+/** Write a validated question atomically. A later acknowledgement, never a watcher tick, removes it. */
+export function writeOwnedQuestionEnvelope(sessionFile: string, envelope: OwnedQuestionEnvelope): void {
+  if (!isOwnedQuestionEnvelope(envelope)) throw new LifecycleError("invalid-identifier", "owned question envelope is invalid");
+  writeAtomicJson(`${sessionFile}.ask`, envelope);
+}
+
+/** Read exactly one expected question event. Malformed or foreign sidecars stay local and are not surfaced. */
+export function readOwnedQuestionEnvelope(sessionFile: string, expectedEventId: string): OwnedQuestionEnvelope | null {
+  if (!OWNED_EVENT_ID.test(expectedEventId)) return null;
+  try {
+    const acknowledgementPath = `${sessionFile}.ask.ack`;
+    if (existsSync(acknowledgementPath)) {
+      const acknowledgement = JSON.parse(readFileSync(acknowledgementPath, "utf8"));
+      if (isOwnedEventAcknowledged(acknowledgement, expectedEventId)) return null;
+    }
+    const envelope = JSON.parse(readFileSync(`${sessionFile}.ask`, "utf8"));
+    return isOwnedQuestionEnvelope(envelope, expectedEventId) ? envelope : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist acknowledgement before deleting the question so restart reconciliation cannot send it twice. */
+export function acknowledgeOwnedQuestionEnvelope(
+  sessionFile: string,
+  eventId: string,
+  acknowledgedAt = new Date().toISOString(),
+): void {
+  const acknowledgement = acknowledgeOwnedEvent(eventId, acknowledgedAt);
+  writeAtomicJson(`${sessionFile}.ask.ack`, acknowledgement);
+  try { unlinkSync(`${sessionFile}.ask`); } catch { /* acknowledgement is authoritative */ }
 }
 
 function hasExactEventIds(binding: OwnedSessionBinding, sessionId: string): boolean {

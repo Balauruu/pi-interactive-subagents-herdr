@@ -17,6 +17,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { writeOwnedQuestionEnvelope } from "./session.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -368,12 +369,32 @@ export default function (pi: ExtensionAPI) {
       // notifies the orchestrator, who replies via subagent_message.
       awaitingAnswer = true;
       recorder.askQuestion();
-      const askData = {
-        name: process.env.PI_SUBAGENT_NAME ?? "subagent",
-        agent: process.env.PI_SUBAGENT_AGENT ?? "",
-        question: params.question,
-      };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      const eventId = process.env.PI_SUBAGENT_QUESTION_EVENT_ID;
+      const rootId = process.env.PI_SUBAGENT_ROOT_ID;
+      const parentId = process.env.PI_SUBAGENT_PARENT_ID;
+      const childId = process.env.PI_SUBAGENT_CHILD_ID;
+      const ownerId = process.env.PI_SUBAGENT_OWNER_ID;
+      const childSessionId = process.env.PI_SUBAGENT_CHILD_SESSION_ID;
+      if (eventId && rootId && parentId && childId && ownerId && childSessionId) {
+        writeOwnedQuestionEnvelope(sessionFile, {
+          eventId,
+          rootId,
+          parentId,
+          childId,
+          ownerId,
+          sessionId: childSessionId,
+          question: params.question,
+        });
+      } else {
+        // Compatibility is intentionally local-only. A real parent launch
+        // provides the complete binding above; an isolated child fixture may
+        // still park a plain sidecar but no owned watcher will surface it.
+        writeFileSync(`${sessionFile}.ask`, JSON.stringify({
+          name: process.env.PI_SUBAGENT_NAME ?? "subagent",
+          agent: process.env.PI_SUBAGENT_AGENT ?? "",
+          question: params.question,
+        }));
+      }
 
       return {
         content: [
