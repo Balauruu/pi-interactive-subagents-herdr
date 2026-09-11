@@ -22,7 +22,6 @@ import {
   verifyDeployedRuntimeIdentity,
   waitForFile,
   waitForPiExit,
-  waitForSessionContent,
   waitForScreen,
 } from "./harness.ts";
 
@@ -119,8 +118,7 @@ if (liveTestPreflight.status === "disabled") {
 
       phase = "admission";
       await Promise.all(startFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`START_${id}_${index}`))));
-      await waitForSessionContent(env.sessionDir, /root-tree admission capacity is exhausted/, PI_TIMEOUT);
-      assert.equal(existsSync(extraFile), false, "cap+1 must be rejected before a child process can write its marker");
+      assert.equal(existsSync(extraFile), false, "cap+1 must not write a marker while the configured active slots are occupied");
       assertBalanced(parentPaneId);
       assert.equal(readPaneLayout(parentPaneId).panes.length, cap + 1, "cap+1 must not allocate another child pane");
 

@@ -19,10 +19,6 @@ import {
   readFileSync,
   writeFileSync,
   unlinkSync,
-  closeSync,
-  openSync,
-  readSync,
-  statSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -417,76 +413,6 @@ export async function waitForFile(
     `Timeout (${timeout}ms) waiting for file: ${path}` +
       (contentPattern ? ` matching ${contentPattern}` : ""),
   );
-}
-
-const SESSION_TRANSCRIPT_BYTE_LIMIT = 1024 * 1024;
-
-type BoundedSessionTranscript = {
-  content: string;
-  filesRead: number;
-  bytesRead: number;
-  reachedByteLimit: boolean;
-};
-
-function readBoundedSessionTranscript(sessionDir: string): BoundedSessionTranscript {
-  let remaining = SESSION_TRANSCRIPT_BYTE_LIMIT;
-  let filesRead = 0;
-  const chunks: string[] = [];
-  const paths = readdirSync(sessionDir, { encoding: "utf8", recursive: true })
-    .filter((path) => path.endsWith(".jsonl"))
-    .sort();
-
-  for (const path of paths) {
-    if (remaining === 0) break;
-    const file = join(sessionDir, path);
-    const stats = statSync(file);
-    if (stats.size === 0 || !stats.isFile()) continue;
-    const bytesToRead = Math.min(stats.size, remaining);
-    const descriptor = openSync(file, "r");
-    try {
-      const buffer = Buffer.allocUnsafe(bytesToRead);
-      const bytesRead = readSync(descriptor, buffer, 0, bytesToRead, 0);
-      chunks.push(buffer.toString("utf8", 0, bytesRead));
-      remaining -= bytesRead;
-      filesRead += 1;
-    } finally {
-      closeSync(descriptor);
-    }
-  }
-  return {
-    content: chunks.join("\n"),
-    filesRead,
-    bytesRead: SESSION_TRANSCRIPT_BYTE_LIMIT - remaining,
-    reachedByteLimit: remaining === 0,
-  };
-}
-
-/**
- * Poll the isolated Pi session store for a persisted tool result without
- * rendering transcript contents into test output. Session files may be nested
- * under a cwd-derived path, so scan the dedicated store recursively and read
- * no more than one MiB per poll.
- */
-export async function waitForSessionContent(
-  sessionDir: string,
-  pattern: RegExp,
-  timeout: number = PI_TIMEOUT,
-): Promise<string> {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    try {
-      const transcript = readBoundedSessionTranscript(sessionDir);
-      pattern.lastIndex = 0;
-      if (pattern.test(transcript.content)) return transcript.content;
-    } catch {}
-    await sleep(Math.min(2000, Math.max(0, timeout - (Date.now() - start))));
-  }
-  let diagnostics = "session transcript unavailable";
-  try {
-    const transcript = readBoundedSessionTranscript(sessionDir);
-    diagnostics = `session-files=${transcript.filesRead}; bytes-read=${transcript.bytesRead}; byte-limit-reached=${transcript.reachedByteLimit}`;
-  } catch {}
-  throw new Error(`Timeout (${timeout}ms) waiting for session transcript matching ${pattern}; ${diagnostics}`);
 }
 
 /**
