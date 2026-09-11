@@ -134,10 +134,9 @@ if (liveTestPreflight.status === "disabled") {
         `task "Run exactly: echo START_${id}_${index} > '${startFile}'; for attempt in {1..300}; do [ -f '${releaseFile}' ] && break; sleep 1; done; [ -f '${releaseFile}' ] || exit 124; echo DONE_${id}_${index} > '${doneFiles[index]}'".`,
       ].join(" "));
       const task = [
-        `Use the auto-discovered subagent tool only. In one assistant response, emit exactly ${cap + 1} subagent calls without waiting for or processing any tool result:`,
+        `Use the auto-discovered subagent tool only. In one assistant response, emit exactly ${cap} subagent calls without waiting for or processing any tool result:`,
         ...childCalls,
-        `Call ${cap + 1}: name "Denied-${id}", agent "test-echo", task "echo DENIED_${id} > '${extraFile}'" while the first ${cap} calls are still active.`,
-        `The final call must be rejected by the configured active-subagent limit. Do not retry it or make any other subagent calls after this batch.`,
+        `Do not make any other subagent calls after this batch.`,
       ].join("\n");
 
       phase = "parent-launch";
@@ -151,10 +150,22 @@ if (liveTestPreflight.status === "disabled") {
       phase = "admission";
       await Promise.all(startFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`START_${id}_${index}`))));
       const admissionPaneIds = readPaneLayout(parentPaneId).panes.map((pane) => pane.paneId);
-      assert.equal(admissionPaneIds.length, cap + 1, "cap+1 must not allocate another child pane");
+      assert.equal(admissionPaneIds.length, cap + 1, "the configured active slots must all be occupied");
+      await waitForBalanced(parentPaneId, admissionPaneIds, 20_000);
+
+      phase = "admission-rejection";
+      sendPiInput(parentPaneId, [
+        `Use the auto-discovered subagent tool exactly once while the existing children remain active.`,
+        `Call it with name "Denied-${id}", agent "test-echo", and task "echo DENIED_${id} > '${extraFile}'".`,
+        `Do not retry it or make any other tool call.`,
+      ].join(" "));
       await waitForScreen(parentPaneId, /root-tree admission\s+capacity is exhausted/, PI_TIMEOUT, 240);
       assert.equal(existsSync(extraFile), false, "cap+1 must not write a marker while the configured active slots are occupied");
-      await waitForBalanced(parentPaneId, admissionPaneIds, 20_000);
+      assert.deepEqual(
+        new Set(readPaneLayout(parentPaneId).panes.map((pane) => pane.paneId)),
+        new Set(admissionPaneIds),
+        "cap+1 rejection must not allocate another child pane",
+      );
       writeFileSync(releaseFile, `RELEASE_${id}\n`);
 
       phase = "delivery-and-release";
