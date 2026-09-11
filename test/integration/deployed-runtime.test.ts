@@ -18,7 +18,6 @@ import {
   queuePiInput,
   readPaneLayout,
   readScreen,
-  sendPiInput,
   startDeployedPi,
   uniqueId,
   verifyDeployedRuntimeIdentity,
@@ -186,7 +185,7 @@ if (liveTestPreflight.status === "disabled") {
       await waitForPaneCount(parentPaneId, 1, PI_TIMEOUT);
 
       phase = "parent-exit";
-      sendPiInput(parentPaneId, "/exit");
+      queuePiInput(parentPaneId, "/exit");
       assert.equal(await waitForPiExit(parentPaneId, PI_TIMEOUT), 0, "isolated parent Pi must exit cleanly");
 
       phase = "owner-cleanup";
