@@ -134,8 +134,8 @@ if (liveTestPreflight.status === "disabled") {
       phase = "admission";
       await Promise.all(startFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`START_${id}_${index}`))));
       assert.equal(existsSync(extraFile), false, "cap+1 must not write a marker while the configured active slots are occupied");
-      await waitForBalanced(parentPaneId);
       assert.equal(readPaneLayout(parentPaneId).panes.length, cap + 1, "cap+1 must not allocate another child pane");
+      await waitForBalanced(parentPaneId);
 
       phase = "delivery-and-release";
       await Promise.all(doneFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`DONE_${id}_${index}`))));
