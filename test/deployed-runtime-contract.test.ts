@@ -10,6 +10,7 @@ import {
   buildDeployedPiCommand,
   cleanupTestEnv,
   createTestEnv,
+  sendPiInput,
   verifyDeployedRuntimeIdentity,
   waitForFile,
 } from "./integration/harness.ts";
@@ -100,6 +101,10 @@ test("file polling honors its requested timeout when a marker never appears", as
   const started = Date.now();
   await assert.rejects(() => waitForFile(missing, 25), /Timeout \(25ms\)/);
   assert.ok(Date.now() - started < 250, "polling must not sleep past its bounded timeout");
+});
+
+test("deployed Pi input rejects an empty user turn before touching Herdr", () => {
+  assert.throws(() => sendPiInput("pane", "  "), /Pi input is required/);
 });
 
 test("deployed integration command rejects missing live authorization before test discovery", () => {

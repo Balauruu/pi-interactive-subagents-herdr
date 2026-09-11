@@ -17,6 +17,7 @@ import {
   paneExists,
   readPaneLayout,
   readScreen,
+  sendPiInput,
   startDeployedPi,
   uniqueId,
   verifyDeployedRuntimeIdentity,
@@ -41,12 +42,16 @@ function assertBalanced(rootPaneId: string, expectedPaneIds?: readonly string[])
   assert.ok(smallest / largest >= MIN_AREA_RATIO, `layout area ratio ${smallest / largest} is below ${MIN_AREA_RATIO}`);
 }
 
-async function waitForBalanced(rootPaneId: string, timeout: number = PI_TIMEOUT): Promise<void> {
+async function waitForBalanced(
+  rootPaneId: string,
+  expectedPaneIds: readonly string[],
+  timeout: number = PI_TIMEOUT,
+): Promise<void> {
   const started = Date.now();
   let lastError: unknown;
   while (Date.now() - started < timeout) {
     try {
-      assertBalanced(rootPaneId);
+      assertBalanced(rootPaneId, expectedPaneIds);
       return;
     } catch (error) {
       lastError = error;
@@ -54,6 +59,19 @@ async function waitForBalanced(rootPaneId: string, timeout: number = PI_TIMEOUT)
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw lastError;
+}
+
+async function waitForPaneCount(rootPaneId: string, expected: number, timeout: number = PI_TIMEOUT): Promise<void> {
+  const started = Date.now();
+  let observed = -1;
+  while (Date.now() - started < timeout) {
+    try {
+      observed = readPaneLayout(rootPaneId).panes.length;
+      if (observed === expected) return;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`Timeout (${timeout}ms) waiting for ${expected} panes; last observed ${observed}`);
 }
 
 function boundedDiagnostics(rootPaneId: string, parentPaneId: string, phase: string): string {
@@ -112,15 +130,13 @@ if (liveTestPreflight.status === "disabled") {
       const extraFile = join(env.dir, "denied-extra.txt");
       const childCalls = startFiles.map((startFile, index) => [
         `Call ${index + 1}: name "Deploy-${id}-${index}", agent "test-echo",`,
-        `task "Run exactly: echo START_${id}_${index} > '${startFile}'; sleep 12; echo DONE_${id}_${index} > '${doneFiles[index]}'".`,
+        `task "Run exactly: echo START_${id}_${index} > '${startFile}'; sleep 30; echo DONE_${id}_${index} > '${doneFiles[index]}'".`,
       ].join(" "));
       const task = [
         `Use the auto-discovered subagent tool only. In one assistant response, emit exactly ${cap + 1} subagent calls without waiting for or processing any tool result:`,
         ...childCalls,
         `Call ${cap + 1}: name "Denied-${id}", agent "test-echo", task "echo DENIED_${id} > '${extraFile}'" while the first ${cap} calls are still active.`,
-        `The final call must be rejected by the configured active-subagent limit. Do not retry it or make any other subagent call until every result from this batch arrives.`,
-        `After all successful child results arrive, make one replacement call named "Replacement-${id}" with agent "test-echo" and task "echo REPLACEMENT_${id} > '${replacementFile}'".`,
-        `After its result arrives, print exactly DEPLOYED_PARENT_COMPLETE_${id} and RESULT_DELIVERED_${id}.`,
+        `The final call must be rejected by the configured active-subagent limit. Do not retry it or make any other subagent calls after this batch.`,
       ].join("\n");
 
       phase = "parent-launch";
@@ -133,15 +149,30 @@ if (liveTestPreflight.status === "disabled") {
 
       phase = "admission";
       await Promise.all(startFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`START_${id}_${index}`))));
+      await waitForScreen(parentPaneId, /root-tree admission\s+capacity is exhausted/, PI_TIMEOUT, 240);
       assert.equal(existsSync(extraFile), false, "cap+1 must not write a marker while the configured active slots are occupied");
-      assert.equal(readPaneLayout(parentPaneId).panes.length, cap + 1, "cap+1 must not allocate another child pane");
-      await waitForBalanced(parentPaneId);
+      const admissionPaneIds = readPaneLayout(parentPaneId).panes.map((pane) => pane.paneId);
+      assert.equal(admissionPaneIds.length, cap + 1, "cap+1 must not allocate another child pane");
+      await waitForBalanced(parentPaneId, admissionPaneIds, 20_000);
 
       phase = "delivery-and-release";
       await Promise.all(doneFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`DONE_${id}_${index}`))));
+      await Promise.all(startFiles.map((_, index) =>
+        waitForScreen(parentPaneId, new RegExp(`✓\\s+Deploy-${id}-${index}`), PI_TIMEOUT, 240)));
+      await waitForPaneCount(parentPaneId, 1, PI_TIMEOUT);
+
+      phase = "slot-reuse";
+      sendPiInput(parentPaneId, [
+        `Use the auto-discovered subagent tool exactly once.`,
+        `Call it with name "Replacement-${id}", agent "test-echo", and task "echo REPLACEMENT_${id} > '${replacementFile}'".`,
+        `Do not make any other tool call.`,
+      ].join(" "));
       await waitForFile(replacementFile, PI_TIMEOUT, new RegExp(`REPLACEMENT_${id}`));
-      const screen = await waitForScreen(parentPaneId, new RegExp(`DEPLOYED_PARENT_COMPLETE_${id}[\\s\\S]*RESULT_DELIVERED_${id}`), PI_TIMEOUT, 180);
-      assert.match(screen, new RegExp(`RESULT_DELIVERED_${id}`), "parent must receive terminal child results");
+      await waitForScreen(parentPaneId, new RegExp(`✓\\s+Replacement-${id}`), PI_TIMEOUT, 240);
+      await waitForPaneCount(parentPaneId, 1, PI_TIMEOUT);
+
+      phase = "parent-exit";
+      sendPiInput(parentPaneId, "/exit");
       assert.equal(await waitForPiExit(parentPaneId, PI_TIMEOUT), 0, "isolated parent Pi must exit cleanly");
 
       phase = "owner-cleanup";

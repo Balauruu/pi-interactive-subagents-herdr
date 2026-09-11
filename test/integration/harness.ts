@@ -360,6 +360,12 @@ export function startDeployedPi(surface: string, options: Omit<DeployedPiCommand
   });
 }
 
+/** Submit a distinct user turn or slash command to an already-running Pi pane. */
+export function sendPiInput(surface: string, input: string): void {
+  if (!input.trim()) throw new Error("Pi input is required.");
+  sendCommand(surface, input);
+}
+
 // ── Polling helpers ──
 
 /**
