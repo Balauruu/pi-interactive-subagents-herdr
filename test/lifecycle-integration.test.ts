@@ -64,7 +64,7 @@ describe("lifecycle runtime integration", () => {
       assert.deepEqual(record.terminalEvidence, evidence);
       assert.equal(record.lease.state, "released");
       assert.deepEqual(calls, ["extract", "deliver", "cleanup", "layout"]);
-      assert.equal(record.transitions.delivery.status, "pending");
+      assert.equal(record.transitions.delivery.status, "ambiguous");
       assert.equal(record.transitions.release.status, "complete");
       assert.equal(record.transitions.cleanup.status, "pending");
     });

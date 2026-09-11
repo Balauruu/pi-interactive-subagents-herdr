@@ -12,8 +12,10 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { randomBytes, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+
+import { LifecycleError } from "./lifecycle.ts";
 
 export interface SessionEntry {
   type: string;
@@ -157,28 +159,167 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
 // lives in the spawner's own artifact dir, which is directly addressable from
 // the spawner's session id (no sessions-tree scan, so resume stays fast).
 
+const OWNED_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const OWNED_EVENT_ID = /^(question|result|notification)-[a-f0-9]{64}$/;
+
+export interface OwnedEventIdentityInput {
+  rootId: string;
+  parentId: string;
+  childId: string;
+  sessionId: string;
+}
+
+export interface OwnedInteractionEventIds {
+  questionEventId: string;
+  terminalResultEventId: string;
+  notificationEventId: string;
+}
+
+export interface OwnedEventAcknowledgement {
+  eventId: string;
+  acknowledgedAt: string;
+}
+
+/** Explicit, parent-local proof that this child belongs to one root and owner. */
+export interface OwnedSessionBinding {
+  rootId: string;
+  parentId: string;
+  parentArtifactDir: string;
+  childId: string;
+  ownerId: string;
+  eventIds: OwnedInteractionEventIds;
+}
+
 export interface NameRegistryEntry {
   /** Absolute path to the subagent's session .jsonl file. */
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /** Omitted only by pre-ownership registry records. */
+  ownership?: OwnedSessionBinding;
+}
+
+export interface OwnedNameRegistryEntry extends NameRegistryEntry {
+  sessionId: string;
+  ownership: OwnedSessionBinding;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
+
+function isOwnedIdentifier(value: unknown): value is string {
+  return typeof value === "string" && OWNED_IDENTIFIER.test(value) && !value.includes("..");
+}
+
+function isRegistryName(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value && !/[\u0000-\u001f]/.test(value) && value !== "__proto__" && value !== "constructor" && value !== "prototype";
+}
+
+function eventId(kind: "question" | "result" | "notification", identity: OwnedEventIdentityInput): string {
+  for (const [label, value] of Object.entries(identity)) {
+    if (!isOwnedIdentifier(value)) throw new LifecycleError("invalid-identifier", `${label} must be a safe owned interaction identifier`);
+  }
+  // Inputs are stable identifiers only. Prompt/result contents never enter a durable dedupe key.
+  return `${kind}-${createHash("sha256").update(JSON.stringify([kind, identity.rootId, identity.parentId, identity.childId, identity.sessionId])).digest("hex")}`;
+}
+
+export function ownedQuestionEventId(identity: OwnedEventIdentityInput): string {
+  return eventId("question", identity);
+}
+
+export function ownedTerminalResultEventId(identity: OwnedEventIdentityInput): string {
+  return eventId("result", identity);
+}
+
+export function ownedNotificationEventId(identity: OwnedEventIdentityInput): string {
+  return eventId("notification", identity);
+}
+
+export function ownedInteractionEventIds(identity: OwnedEventIdentityInput): OwnedInteractionEventIds {
+  return {
+    questionEventId: ownedQuestionEventId(identity),
+    terminalResultEventId: ownedTerminalResultEventId(identity),
+    notificationEventId: ownedNotificationEventId(identity),
+  };
+}
+
+/** Create the durable acknowledgement written only after the parent send completes. */
+export function acknowledgeOwnedEvent(eventId: string, acknowledgedAt = new Date().toISOString()): OwnedEventAcknowledgement {
+  if (!OWNED_EVENT_ID.test(eventId) || !Number.isFinite(Date.parse(acknowledgedAt))) {
+    throw new LifecycleError("invalid-identifier", "owned event acknowledgement is invalid");
+  }
+  return { eventId, acknowledgedAt };
+}
+
+export function isOwnedEventAcknowledged(value: unknown, expectedEventId: string): value is OwnedEventAcknowledgement {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    (value as OwnedEventAcknowledgement).eventId === expectedEventId &&
+    OWNED_EVENT_ID.test(expectedEventId) &&
+    typeof (value as OwnedEventAcknowledgement).acknowledgedAt === "string" &&
+    Number.isFinite(Date.parse((value as OwnedEventAcknowledgement).acknowledgedAt)),
+  );
+}
+
+function hasExactEventIds(binding: OwnedSessionBinding, sessionId: string): boolean {
+  const expected = ownedInteractionEventIds({
+    rootId: binding.rootId,
+    parentId: binding.parentId,
+    childId: binding.childId,
+    sessionId,
+  });
+  return (
+    binding.eventIds.questionEventId === expected.questionEventId &&
+    binding.eventIds.terminalResultEventId === expected.terminalResultEventId &&
+    binding.eventIds.notificationEventId === expected.notificationEventId
+  );
+}
+
+function isOwnedBinding(value: unknown, sessionId: string): value is OwnedSessionBinding {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const binding = value as OwnedSessionBinding;
+  if (
+    !isOwnedIdentifier(binding.rootId) || !isOwnedIdentifier(binding.parentId) ||
+    !isOwnedIdentifier(binding.childId) || !isOwnedIdentifier(binding.ownerId) ||
+    typeof binding.parentArtifactDir !== "string" || !isAbsolute(binding.parentArtifactDir) ||
+    !binding.eventIds || typeof binding.eventIds !== "object"
+  ) return false;
+  try {
+    return hasExactEventIds(binding, sessionId);
+  } catch {
+    return false;
+  }
+}
+
+function isNameRegistryEntry(value: unknown): value is NameRegistryEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as NameRegistryEntry;
+  if (typeof entry.sessionFile !== "string" || !isAbsolute(entry.sessionFile) || entry.sessionFile.includes("\u0000")) return false;
+  if (entry.sessionId !== null && !isOwnedIdentifier(entry.sessionId)) return false;
+  return entry.ownership === undefined || (entry.sessionId !== null && isOwnedBinding(entry.ownership, entry.sessionId));
+}
 
 /** Path of the name registry for a given spawner session's artifact dir. */
 export function nameRegistryPath(artifactDir: string): string {
   return join(artifactDir, "subagent-registry.json");
 }
 
-/** Read a spawner session's name registry, or {} if absent/corrupt. */
+/**
+ * Read and validate only the current parent's local registry. Corrupt entries
+ * are ignored individually, preserving unrelated resumable children without a
+ * global session scan.
+ */
 export function readNameRegistry(artifactDir: string): NameRegistry {
   try {
     const p = nameRegistryPath(artifactDir);
     if (!existsSync(p)) return {};
-    const parsed = JSON.parse(readFileSync(p, "utf8"));
+    const parsed: unknown = JSON.parse(readFileSync(p, "utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return parsed as NameRegistry;
+    const registry: NameRegistry = {};
+    for (const [name, entry] of Object.entries(parsed)) {
+      if (isRegistryName(name) && isNameRegistryEntry(entry)) registry[name] = entry;
+    }
+    return registry;
   } catch {
     return {};
   }
@@ -187,19 +328,16 @@ export function readNameRegistry(artifactDir: string): NameRegistry {
 /**
  * Register (or overwrite) a name → session mapping for a spawner session.
  * Writes atomically (temp file + rename) so a concurrent reader never sees a
- * partial registry.
+ * partial registry. Invalid untrusted input is deliberately ignored.
  */
-export function registerName(
-  artifactDir: string,
-  name: string,
-  entry: NameRegistryEntry,
-): void {
+export function registerName(artifactDir: string, name: string, entry: NameRegistryEntry): void {
   try {
+    if (!isRegistryName(name) || !isNameRegistryEntry(entry)) return;
     mkdirSync(artifactDir, { recursive: true });
     const registry = readNameRegistry(artifactDir);
     registry[name] = entry;
     const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+    const tmp = `${p}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
     writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
     renameSync(tmp, p);
   } catch {
@@ -209,12 +347,77 @@ export function registerName(
 }
 
 /** Resolve a name to its registry entry within a spawner session, or null. */
-export function resolveNameInRegistry(
-  artifactDir: string,
-  name: string,
-): NameRegistryEntry | null {
-  const entry = readNameRegistry(artifactDir)[name];
-  return entry && typeof entry.sessionFile === "string" ? entry : null;
+export function resolveNameInRegistry(artifactDir: string, name: string): NameRegistryEntry | null {
+  if (!isRegistryName(name)) return null;
+  return readNameRegistry(artifactDir)[name] ?? null;
+}
+
+export interface OwnedNameResolution {
+  artifactDir: string;
+  name: string;
+  rootId: string;
+  parentId: string;
+  ownerId: string;
+}
+
+/**
+ * Return a registry entry only when all ownership fields and the parent-local
+ * artifact directory agree. Legacy entries deliberately cannot satisfy this
+ * proof and must be upgraded only after their parent session is verified.
+ */
+export function resolveOwnedNameInRegistry(params: OwnedNameResolution): OwnedNameRegistryEntry | null {
+  if (!isRegistryName(params.name) || !isOwnedIdentifier(params.rootId) || !isOwnedIdentifier(params.parentId) || !isOwnedIdentifier(params.ownerId)) return null;
+  const entry = resolveNameInRegistry(params.artifactDir, params.name);
+  if (!entry || !entry.ownership || entry.sessionId === null) return null;
+  const binding = entry.ownership;
+  if (!isOwnedBinding(binding, entry.sessionId)) return null;
+  if (resolve(binding.parentArtifactDir) !== resolve(params.artifactDir)) return null;
+  if (binding.rootId !== params.rootId || binding.parentId !== params.parentId || binding.ownerId !== params.ownerId) return null;
+  return entry as OwnedNameRegistryEntry;
+}
+
+export interface LegacyOwnedNameResolution extends OwnedNameResolution {
+  childId: string;
+  parentSessionFile: string;
+}
+
+/**
+ * Materialize an in-memory owned record from a legacy entry only after the
+ * child's own session header proves direct lineage to this exact parent. The
+ * caller may atomically write the returned record back through registerName.
+ */
+export function recoverLegacyOwnedNameInRegistry(params: LegacyOwnedNameResolution): OwnedNameRegistryEntry | null {
+  if (
+    !isRegistryName(params.name) || !isOwnedIdentifier(params.rootId) ||
+    !isOwnedIdentifier(params.parentId) || !isOwnedIdentifier(params.ownerId) ||
+    !isOwnedIdentifier(params.childId) || !isAbsolute(params.artifactDir) || !isAbsolute(params.parentSessionFile)
+  ) return null;
+  const entry = resolveNameInRegistry(params.artifactDir, params.name);
+  if (!entry || entry.ownership || entry.sessionId === null) return null;
+  const firstLine = readFirstLine(entry.sessionFile)?.trim();
+  if (!firstLine) return null;
+  try {
+    const header = JSON.parse(firstLine) as { type?: unknown; id?: unknown; parentSession?: unknown };
+    if (
+      header.type !== "session" || header.id !== entry.sessionId ||
+      typeof header.parentSession !== "string" || !isAbsolute(header.parentSession) ||
+      resolve(header.parentSession) !== resolve(params.parentSessionFile)
+    ) return null;
+  } catch {
+    return null;
+  }
+  const identity = { rootId: params.rootId, parentId: params.parentId, childId: params.childId, sessionId: entry.sessionId };
+  return {
+    ...entry,
+    ownership: {
+      rootId: params.rootId,
+      parentId: params.parentId,
+      parentArtifactDir: resolve(params.artifactDir),
+      childId: params.childId,
+      ownerId: params.ownerId,
+      eventIds: ownedInteractionEventIds(identity),
+    },
+  };
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {

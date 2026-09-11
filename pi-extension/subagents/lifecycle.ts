@@ -11,16 +11,17 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-const STATE_VERSION = 1;
+const STATE_VERSION = 2;
+const LEGACY_STATE_VERSION = 1;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const PHASES = ["starting", "running", "waiting", "interactive", "terminal", "cancelled"] as const;
 const ACTIVE_PHASES = ["starting", "running", "waiting", "interactive"] as const;
-const TRANSITIONS = ["extraction", "delivery", "release", "cleanup", "layout"] as const;
+const TRANSITIONS = ["extraction", "delivery", "release", "cleanup", "layout", "notification"] as const;
 
 type LifecyclePhase = (typeof PHASES)[number];
 type ActiveLifecyclePhase = (typeof ACTIVE_PHASES)[number];
-type TransitionName = (typeof TRANSITIONS)[number];
-type TransitionStatus = "pending" | "claimed" | "complete";
+export type TransitionName = (typeof TRANSITIONS)[number];
+type TransitionStatus = "pending" | "claimed" | "complete" | "ambiguous";
 
 export type LifecycleErrorCode =
   | "invalid-identifier"
@@ -198,7 +199,7 @@ function validActivePhase(value: unknown): value is ActiveLifecyclePhase {
 function isLifecycleTransition(value: unknown): value is LifecycleTransition {
   return (
     isRecord(value) &&
-    (value.status === "pending" || value.status === "claimed" || value.status === "complete") &&
+    (value.status === "pending" || value.status === "claimed" || value.status === "complete" || value.status === "ambiguous") &&
     (value.ownerId === null || assertIdentifierForSchema(value.ownerId)) &&
     typeof value.attempts === "number" && Number.isInteger(value.attempts) && value.attempts >= 0 &&
     (value.claimedAt === null || isTimestamp(value.claimedAt)) &&
@@ -237,6 +238,26 @@ function assertLeaseForSchema(value: unknown): value is string {
 function isLifecycleState(value: unknown): value is RootTreeLifecycleState {
   if (!isRecord(value) || value.version !== STATE_VERSION || !assertIdentifierForSchema(value.rootId) || !isRecord(value.children) || !isTimestamp(value.updatedAt)) return false;
   return Object.entries(value.children).every(([childId, child]) => assertIdentifierForSchema(childId) && isChildRecord(child, childId));
+}
+
+/** Add the independent notification transition to valid v1 state before use. */
+function migrateLegacyState(value: unknown): unknown {
+  if (!isRecord(value) || value.version !== LEGACY_STATE_VERSION || !isRecord(value.children)) return value;
+  const upgraded = clone(value) as Record<string, unknown>;
+  const children = upgraded.children as Record<string, unknown>;
+  for (const child of Object.values(children)) {
+    if (!isRecord(child) || !isRecord(child.transitions) || child.transitions.notification !== undefined) return value;
+    child.transitions.notification = {
+      status: "pending",
+      ownerId: null,
+      attempts: 0,
+      claimedAt: null,
+      completedAt: null,
+      lastError: null,
+    };
+  }
+  upgraded.version = STATE_VERSION;
+  return upgraded;
 }
 
 /** Return the propagated root when supplied, otherwise the current session's stable id. */
@@ -361,7 +382,7 @@ export class RootTreeLifecycleCoordinator {
         throw new LifecycleError("terminal-evidence-required", "terminal evidence must be persisted before settlement");
       }
       const transition = child.transitions[params.transition];
-      if (transition.status === "complete") return { changed: false, result: { claimed: false, attempts: transition.attempts } };
+      if (transition.status === "complete" || transition.status === "ambiguous") return { changed: false, result: { claimed: false, attempts: transition.attempts } };
       if (transition.status === "claimed") {
         if (transition.ownerId !== params.ownerId) throw new LifecycleError("transition-owned", "transition is claimed by another owner");
         if (transition.attempts >= this.maxTransitionAttempts) throw new LifecycleError("retry-exhausted", "transition retry budget is exhausted");
@@ -414,6 +435,32 @@ export class RootTreeLifecycleCoordinator {
     });
   }
 
+  /**
+   * Fence a claimed external transition after invocation has an unknown result.
+   * It is terminal but deliberately not reported as complete, so recovery can
+   * inspect the redacted error without risking a duplicate parent-visible send.
+   */
+  fenceAmbiguousTransition(params: { childId: string; ownerId: string; leaseToken: string; transition: TransitionName; error: string }): { fenced: boolean; attempts: number } {
+    assertIdentifier(params.childId, "child id");
+    assertIdentifier(params.ownerId, "owner id");
+    assertLeaseToken(params.leaseToken);
+    if (!validTransition(params.transition)) throw new LifecycleError("invalid-configuration", "unknown lifecycle transition");
+    if (typeof params.error !== "string" || !isShortText(params.error) || params.error.trim() === "") throw new LifecycleError("invalid-configuration", "transition error is invalid");
+    return this.mutate((state) => {
+      const child = this.assertLeaseOwner(state, params);
+      const transition = child.transitions[params.transition];
+      if (transition.status === "ambiguous") return { changed: false, result: { fenced: false, attempts: transition.attempts } };
+      if (transition.status !== "claimed") throw new LifecycleError("transition-not-claimed", "transition must be claimed before fencing");
+      if (transition.ownerId !== params.ownerId) throw new LifecycleError("transition-owned", "transition is claimed by another owner");
+      transition.status = "ambiguous";
+      transition.completedAt = this.timestamp();
+      transition.lastError = params.error;
+      child.lastTransitionError = `${params.transition}: ${params.error}`;
+      this.touch(state, child);
+      return { changed: true, result: { fenced: true, attempts: transition.attempts } };
+    });
+  }
+
   releaseLease(params: { childId: string; ownerId: string; leaseToken: string }): { released: boolean; lease: LifecycleLease } {
     assertIdentifier(params.childId, "child id");
     assertIdentifier(params.ownerId, "owner id");
@@ -459,9 +506,10 @@ export class RootTreeLifecycleCoordinator {
     } catch {
       throw new LifecycleError("malformed-state", "lifecycle state is unreadable or malformed");
     }
-    if (!isLifecycleState(parsed)) throw new LifecycleError("malformed-state", "lifecycle state does not match the supported schema");
-    if (parsed.rootId !== this.options.rootId) throw new LifecycleError("root-mismatch", "artifact state belongs to another root");
-    return parsed;
+    const upgraded = migrateLegacyState(parsed);
+    if (!isLifecycleState(upgraded)) throw new LifecycleError("malformed-state", "lifecycle state does not match the supported schema");
+    if (upgraded.rootId !== this.options.rootId) throw new LifecycleError("root-mismatch", "artifact state belongs to another root");
+    return upgraded;
   }
 
   private writeState(state: RootTreeLifecycleState): void {

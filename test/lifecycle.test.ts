@@ -236,6 +236,17 @@ describe("root-tree lifecycle coordinator", () => {
     });
   });
 
+  it("migrates a valid v1 sidecar by adding a pending notification transition", () => {
+    withCoordinator({}, (coordinator, artifactDir) => {
+      coordinator.acquire({ childId: "child", ownerId: "owner" });
+      const state = JSON.parse(readFileSync(join(artifactDir, "subagent-lifecycle.json"), "utf8"));
+      state.version = 1;
+      delete state.children.child.transitions.notification;
+      writeFileSync(join(artifactDir, "subagent-lifecycle.json"), JSON.stringify(state), "utf8");
+      assert.equal(coordinator.inspect().children.child.transitions.notification.status, "pending");
+    });
+  });
+
   it("rejects state that is syntactically valid but violates lifecycle invariants", () => {
     withCoordinator({}, (coordinator, artifactDir) => {
       coordinator.acquire({ childId: "child", ownerId: "owner" });

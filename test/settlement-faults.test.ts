@@ -83,8 +83,9 @@ describe("fault-isolated lifecycle settlement", () => {
       record = run.coordinator.inspect().children.child!;
       assert.equal(record.lease.state, "released");
       assert.equal(record.transitions.release.status, "complete");
-      assert.equal(record.transitions.delivery.attempts, 2);
-      assert.equal(record.transitions.delivery.lastError, "delivery retry suppressed after prior failure");
+      assert.equal(record.transitions.delivery.status, "ambiguous");
+      assert.equal(record.transitions.delivery.attempts, 1);
+      assert.equal(record.transitions.delivery.lastError, "external lifecycle action failed");
       assert.equal(order.filter((entry) => entry === "delivery").length, 1);
       assert.deepEqual(order, [
         "extraction", "delivery", "release", "cleanup:owned-pane", "layout",

@@ -24,6 +24,8 @@ export interface SettlementActions {
   delivery?: () => void | Promise<void>;
   cleanup?: () => void | Promise<void>;
   layout?: () => void | Promise<void>;
+  /** A parent-visible terminal notice, independently deduped from result delivery. */
+  notification?: () => void | Promise<void>;
 }
 
 function safeError(error: unknown): string {
@@ -89,7 +91,7 @@ export function persistLifecycleTerminal(run: LifecycleRun, evidence: TerminalEv
 
 async function independentlySettle(
   run: LifecycleRun,
-  transition: "extraction" | "delivery" | "release" | "cleanup" | "layout",
+  transition: "extraction" | "delivery" | "release" | "cleanup" | "layout" | "notification",
   action: (() => void | Promise<void>) | undefined,
 ): Promise<void> {
   try {
@@ -97,16 +99,16 @@ async function independentlySettle(
     const claim = run.coordinator.claimTransition({ childId: run.childId, ownerId: run.ownerId, leaseToken: run.lease.token, transition });
     if (!claim.claimed) return;
     try {
-      // Parent delivery is an externally visible side effect. A rejection after
-      // invocation is ambiguous, so consume the bounded retry rather than risk
-      // sending the same terminal result twice.
-      if (transition === "delivery" && prior?.attempts && prior.lastError) {
-        run.coordinator.completeTransition({
+      // Parent delivery and notification are externally visible side effects.
+      // A prior post-invocation failure is unknowable after restart, so fence it
+      // rather than risk replaying the same parent-visible event.
+      if ((transition === "delivery" || transition === "notification") && prior?.attempts && prior.lastError) {
+        run.coordinator.fenceAmbiguousTransition({
           childId: run.childId,
           ownerId: run.ownerId,
           leaseToken: run.lease.token,
           transition,
-          error: "delivery retry suppressed after prior failure",
+          error: `${transition} retry suppressed after prior failure`,
         });
         return;
       }
@@ -114,7 +116,18 @@ async function independentlySettle(
       else await action?.();
       run.coordinator.completeTransition({ childId: run.childId, ownerId: run.ownerId, leaseToken: run.lease.token, transition });
     } catch (error) {
-      run.coordinator.completeTransition({ childId: run.childId, ownerId: run.ownerId, leaseToken: run.lease.token, transition, error: safeError(error) });
+      const failure = safeError(error);
+      if (transition === "delivery" || transition === "notification") {
+        run.coordinator.fenceAmbiguousTransition({
+          childId: run.childId,
+          ownerId: run.ownerId,
+          leaseToken: run.lease.token,
+          transition,
+          error: failure,
+        });
+      } else {
+        run.coordinator.completeTransition({ childId: run.childId, ownerId: run.ownerId, leaseToken: run.lease.token, transition, error: failure });
+      }
     }
   } catch {
     // A conflicting owner or exhausted retry budget is durable state. Do not perform speculative work.
@@ -128,6 +141,7 @@ export async function settleLifecycleRun(run: LifecycleRun, actions: SettlementA
   await independentlySettle(run, "release");
   await independentlySettle(run, "cleanup", actions.cleanup);
   await independentlySettle(run, "layout", actions.layout);
+  await independentlySettle(run, "notification", actions.notification);
 }
 
 /** Pre-launch failures become cancellation evidence and still release their admission slot. */
