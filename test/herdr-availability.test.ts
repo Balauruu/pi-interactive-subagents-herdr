@@ -20,3 +20,22 @@ test("rejects malformed or pane-less Herdr CLI responses", () => {
   assert.equal(__herdrTest__.currentHerdrPaneIdFromProbe(() => JSON.stringify({ result: { pane: {} } })), null);
   assert.equal(__herdrTest__.currentHerdrPaneIdFromProbe(() => JSON.stringify({ result: { pane: { pane_id: "" } } })), null);
 });
+
+test("keeps generated-script metadata comment-only across injected newlines", () => {
+  const script = __herdrTest__.renderLongCommandScript(
+    "printf '%s\n' launched",
+    "# Subagent launch script for safe\nprintf injected\r\n# Surface: workspace:root",
+  );
+
+  assert.equal(
+    script,
+    [
+      "#!/bin/bash",
+      "# Subagent launch script for safe",
+      "# printf injected",
+      "# Surface: workspace:root",
+      "printf '%s\n' launched",
+      "",
+    ].join("\n"),
+  );
+});

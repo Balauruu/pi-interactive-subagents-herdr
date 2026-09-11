@@ -74,7 +74,7 @@ export function isMuxAvailable(): boolean {
   return currentHerdrPaneId() !== null;
 }
 
-export const __herdrTest__ = { currentHerdrPaneIdFromProbe };
+export const __herdrTest__ = { currentHerdrPaneIdFromProbe, renderLongCommandScript };
 
 export function muxSetupHint(): string {
   return "Start pi inside Herdr (`herdr`).";
@@ -395,6 +395,22 @@ export function sendCommand(surface: string, command: string): void {
   execFileSync("herdr", ["pane", "run", surface, command], { encoding: "utf8" });
 }
 
+function renderCommentOnlyPreamble(preamble: string): string {
+  return preamble
+    .trimEnd()
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.startsWith("#") ? line : `# ${line}`)
+    .join("\n");
+}
+
+function renderLongCommandScript(command: string, scriptPreamble?: string): string {
+  const scriptParts = ["#!/bin/bash"];
+  if (scriptPreamble) scriptParts.push(renderCommentOnlyPreamble(scriptPreamble));
+  scriptParts.push(command);
+  return scriptParts.join("\n") + "\n";
+}
+
 export function sendLongCommand(
   surface: string,
   command: string,
@@ -402,10 +418,7 @@ export function sendLongCommand(
 ): string {
   const scriptPath = options?.scriptPath ?? join(tmpdir(), "pi-subagent-scripts", `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`);
   mkdirSync(dirname(scriptPath), { recursive: true });
-  const scriptParts = ["#!/bin/bash"];
-  if (options?.scriptPreamble) scriptParts.push(options.scriptPreamble.trimEnd());
-  scriptParts.push(command);
-  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", { mode: 0o755 });
+  writeFileSync(scriptPath, renderLongCommandScript(command, options?.scriptPreamble), { mode: 0o755 });
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
