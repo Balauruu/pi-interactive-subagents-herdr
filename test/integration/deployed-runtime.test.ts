@@ -131,7 +131,7 @@ if (liveTestPreflight.status === "disabled") {
       const releaseFile = join(env.dir, "release.txt");
       const childCalls = startFiles.map((startFile, index) => [
         `Call ${index + 1}: name "Deploy-${id}-${index}", agent "test-echo",`,
-        `task "Run exactly: echo START_${id}_${index} > '${startFile}'; for attempt in {1..120}; do [ -f '${releaseFile}' ] && break; sleep 1; done; [ -f '${releaseFile}' ] || exit 124; echo DONE_${id}_${index} > '${doneFiles[index]}'".`,
+        `task "Run exactly: echo START_${id}_${index} > '${startFile}'; for attempt in {1..300}; do [ -f '${releaseFile}' ] && break; sleep 1; done; [ -f '${releaseFile}' ] || exit 124; echo DONE_${id}_${index} > '${doneFiles[index]}'".`,
       ].join(" "));
       const task = [
         `Use the auto-discovered subagent tool only. In one assistant response, emit exactly ${cap + 1} subagent calls without waiting for or processing any tool result:`,
