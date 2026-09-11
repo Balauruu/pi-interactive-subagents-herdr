@@ -110,7 +110,8 @@ test("delivered-result polling finds a successful structured parent message", as
   try {
     const nested = join(dir, "cwd");
     mkdirSync(nested, { recursive: true });
-    writeFileSync(join(nested, "session.jsonl"), [
+    writeFileSync(join(nested, "z-child.jsonl"), "x".repeat(1024 * 1024));
+    writeFileSync(join(nested, "a-parent.jsonl"), [
       JSON.stringify({ type: "session", id: "header" }),
       JSON.stringify({
         type: "custom_message",

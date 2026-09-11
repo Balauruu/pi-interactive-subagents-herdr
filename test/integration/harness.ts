@@ -438,6 +438,7 @@ export async function waitForFile(
 }
 
 const SESSION_SCAN_BYTE_LIMIT = 1024 * 1024;
+const SESSION_SCAN_FILE_LIMIT = 16;
 
 function readSessionTail(path: string, remaining: number): string {
   const size = statSync(path).size;
@@ -462,15 +463,13 @@ export async function waitForDeliveredSubagent(
   const started = Date.now();
   while (Date.now() - started < timeout) {
     try {
-      let remaining = SESSION_SCAN_BYTE_LIMIT;
       const paths = readdirSync(sessionDir, { encoding: "utf8", recursive: true })
         .filter((path) => path.endsWith(".jsonl"))
         .sort()
-        .reverse();
+        .reverse()
+        .slice(0, SESSION_SCAN_FILE_LIMIT);
       for (const relativePath of paths) {
-        if (remaining === 0) break;
-        const content = readSessionTail(join(sessionDir, relativePath), remaining);
-        remaining -= Buffer.byteLength(content);
+        const content = readSessionTail(join(sessionDir, relativePath), SESSION_SCAN_BYTE_LIMIT);
         for (const line of content.split("\n")) {
           try {
             const entry = JSON.parse(line) as {
