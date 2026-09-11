@@ -22,9 +22,18 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
+  layoutSurfaces,
   shellEscape,
   readScreen,
 } from "./herdr.ts";
+import {
+  admitLifecycleRun,
+  lifecycleEnvParts,
+  markLifecycleRunning,
+  persistLifecycleTerminal,
+  settleLifecycleRun,
+  type LifecycleRun,
+} from "./lifecycle-runtime.ts";
 
 import {
   countSessionEntryLines,
@@ -709,6 +718,8 @@ interface RunningSubagent {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+/** Durable owner-fenced runs, retained independently from the local widget cache. */
+const lifecycleRuns = new Map<string, LifecycleRun>();
 
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
@@ -1286,6 +1297,15 @@ async function launchSubagent(
   if (!sessionFile) throw new Error("No session file");
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+  // Admission is deliberately ahead of createSurface and command construction.
+  const lifecycle = admitLifecycleRun({
+    sessionId,
+    artifactDir,
+    childId: `child-${id}`,
+    ownerId: `owner-${id}`,
+  });
+  lifecycleRuns.set(id, lifecycle);
+  markLifecycleRunning(lifecycle);
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir, globalAgentDir } =
     resolveSubagentPaths(params, agentDefs);
@@ -1467,6 +1487,7 @@ async function launchSubagent(
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = buildAgentDirectoryEnvParts(resolvedAgentDir, globalAgentDir);
+  envParts.push(...lifecycleEnvParts(lifecycle, shellEscape));
 
   if (grantSpawning && agentDefs?.subagentAgents) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
@@ -1644,6 +1665,17 @@ async function watchSubagent(
     });
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const lifecycle = lifecycleRuns.get(running.id);
+    if (lifecycle) {
+      persistLifecycleTerminal(lifecycle, {
+        exitCode: result.exitCode,
+        sentinel: running.sentinelFile ? `sentinel:${running.sentinelFile.split("/").pop()}` : null,
+        transcriptRef: running.sentinelFile ? `transcript:${running.sentinelFile.split("/").pop()}` : null,
+        sessionRef: existsSync(sessionFile) ? getSessionId(sessionFile) : null,
+        cancelled: false,
+        observedAt: new Date().toISOString(),
+      });
+    }
 
     if (running.cli === "claude") {
       // Claude Code result extraction
@@ -1675,7 +1707,9 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      if (lifecycle) await settleLifecycleRun(lifecycle, { cleanup: () => closeSurface(surface), layout: layoutSurfaces });
+      else closeSurface(surface);
+      lifecycleRuns.delete(running.id);
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -2257,6 +2291,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
+        const sessionId = ctx.sessionManager.getSessionId();
+        const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+        const lifecycle = admitLifecycleRun({
+          sessionId,
+          artifactDir,
+          childId: `resume-${id}`,
+          ownerId: `owner-${id}`,
+        });
+        lifecycleRuns.set(id, lifecycle);
+        markLifecycleRunning(lifecycle);
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
@@ -2267,8 +2311,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
 
-        const sessionId = ctx.sessionManager.getSessionId();
-        const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
 
@@ -2302,6 +2344,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           resumeAgentDir,
           resumeGlobalAgentDir,
         );
+        resumeEnvParts.push(...lifecycleEnvParts(lifecycle, shellEscape));
         if (loadout.spawnable && loadout.spawnable.length > 0) {
           resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
         }

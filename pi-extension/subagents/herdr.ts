@@ -345,11 +345,15 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   return stdout;
 }
 
-/** Close a Herdr pane. */
+/** Close a Herdr pane without changing layout. Ownership is checked by the caller. */
 export function closeSurface(surface: string): void {
-  const tracked = untrackBalancedSurface(surface);
+  untrackBalancedSurface(surface);
   runHerdrJson(["pane", "close", surface], "pane close");
-  if (tracked) rebalanceSurfaces();
+}
+
+/** Rebalance tracked panes as a separate failure-isolated transition. */
+export function layoutSurfaces(): void {
+  rebalanceSurfaces();
 }
 
 // ── Exit polling ──
