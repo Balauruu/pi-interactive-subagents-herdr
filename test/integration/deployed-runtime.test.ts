@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -128,9 +128,10 @@ if (liveTestPreflight.status === "disabled") {
       const doneFiles = Array.from({ length: cap }, (_, index) => join(env!.dir, `done-${index}.txt`));
       const replacementFile = join(env.dir, "replacement.txt");
       const extraFile = join(env.dir, "denied-extra.txt");
+      const releaseFile = join(env.dir, "release.txt");
       const childCalls = startFiles.map((startFile, index) => [
         `Call ${index + 1}: name "Deploy-${id}-${index}", agent "test-echo",`,
-        `task "Run exactly: echo START_${id}_${index} > '${startFile}'; sleep 30; echo DONE_${id}_${index} > '${doneFiles[index]}'".`,
+        `task "Run exactly: echo START_${id}_${index} > '${startFile}'; for attempt in {1..120}; do [ -f '${releaseFile}' ] && break; sleep 1; done; [ -f '${releaseFile}' ] || exit 124; echo DONE_${id}_${index} > '${doneFiles[index]}'".`,
       ].join(" "));
       const task = [
         `Use the auto-discovered subagent tool only. In one assistant response, emit exactly ${cap + 1} subagent calls without waiting for or processing any tool result:`,
@@ -149,11 +150,12 @@ if (liveTestPreflight.status === "disabled") {
 
       phase = "admission";
       await Promise.all(startFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`START_${id}_${index}`))));
-      await waitForScreen(parentPaneId, /root-tree admission\s+capacity is exhausted/, PI_TIMEOUT, 240);
-      assert.equal(existsSync(extraFile), false, "cap+1 must not write a marker while the configured active slots are occupied");
       const admissionPaneIds = readPaneLayout(parentPaneId).panes.map((pane) => pane.paneId);
       assert.equal(admissionPaneIds.length, cap + 1, "cap+1 must not allocate another child pane");
+      await waitForScreen(parentPaneId, /root-tree admission\s+capacity is exhausted/, PI_TIMEOUT, 240);
+      assert.equal(existsSync(extraFile), false, "cap+1 must not write a marker while the configured active slots are occupied");
       await waitForBalanced(parentPaneId, admissionPaneIds, 20_000);
+      writeFileSync(releaseFile, `RELEASE_${id}\n`);
 
       phase = "delivery-and-release";
       await Promise.all(doneFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`DONE_${id}_${index}`))));
