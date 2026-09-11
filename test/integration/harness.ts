@@ -421,8 +421,16 @@ export async function waitForFile(
 
 const SESSION_TRANSCRIPT_BYTE_LIMIT = 1024 * 1024;
 
-function readBoundedSessionTranscript(sessionDir: string): string {
+type BoundedSessionTranscript = {
+  content: string;
+  filesRead: number;
+  bytesRead: number;
+  reachedByteLimit: boolean;
+};
+
+function readBoundedSessionTranscript(sessionDir: string): BoundedSessionTranscript {
   let remaining = SESSION_TRANSCRIPT_BYTE_LIMIT;
+  let filesRead = 0;
   const chunks: string[] = [];
   const paths = readdirSync(sessionDir, { encoding: "utf8", recursive: true })
     .filter((path) => path.endsWith(".jsonl"))
@@ -440,11 +448,17 @@ function readBoundedSessionTranscript(sessionDir: string): string {
       const bytesRead = readSync(descriptor, buffer, 0, bytesToRead, 0);
       chunks.push(buffer.toString("utf8", 0, bytesRead));
       remaining -= bytesRead;
+      filesRead += 1;
     } finally {
       closeSync(descriptor);
     }
   }
-  return chunks.join("\n");
+  return {
+    content: chunks.join("\n"),
+    filesRead,
+    bytesRead: SESSION_TRANSCRIPT_BYTE_LIMIT - remaining,
+    reachedByteLimit: remaining === 0,
+  };
 }
 
 /**
@@ -461,13 +475,18 @@ export async function waitForSessionContent(
   const start = Date.now();
   while (Date.now() - start < timeout) {
     try {
-      const content = readBoundedSessionTranscript(sessionDir);
+      const transcript = readBoundedSessionTranscript(sessionDir);
       pattern.lastIndex = 0;
-      if (pattern.test(content)) return content;
+      if (pattern.test(transcript.content)) return transcript.content;
     } catch {}
     await sleep(Math.min(2000, Math.max(0, timeout - (Date.now() - start))));
   }
-  throw new Error(`Timeout (${timeout}ms) waiting for session transcript matching ${pattern}`);
+  let diagnostics = "session transcript unavailable";
+  try {
+    const transcript = readBoundedSessionTranscript(sessionDir);
+    diagnostics = `session-files=${transcript.filesRead}; bytes-read=${transcript.bytesRead}; byte-limit-reached=${transcript.reachedByteLimit}`;
+  } catch {}
+  throw new Error(`Timeout (${timeout}ms) waiting for session transcript matching ${pattern}; ${diagnostics}`);
 }
 
 /**
