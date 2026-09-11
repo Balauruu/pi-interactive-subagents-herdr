@@ -470,11 +470,11 @@ export async function waitForDeliveredSubagent(
           try {
             const entry = JSON.parse(line) as {
               type?: string;
-              message?: { role?: string; customType?: string; details?: { name?: string; exitCode?: number } };
+              customType?: string;
+              details?: { name?: string; exitCode?: number };
             };
-            const message = entry.type === "message" ? entry.message : undefined;
-            if (message?.role !== "custom" || message.customType !== "subagent_result" || message.details?.name !== name) continue;
-            if (message.details.exitCode !== 0) throw new Error(`Subagent ${name} delivered exit code ${message.details.exitCode}`);
+            if (entry.type !== "custom_message" || entry.customType !== "subagent_result" || entry.details?.name !== name) continue;
+            if (entry.details.exitCode !== 0) throw new Error(`Subagent ${name} delivered exit code ${entry.details.exitCode}`);
             return;
           } catch (error) {
             if (error instanceof Error && error.message.startsWith(`Subagent ${name} delivered`)) throw error;

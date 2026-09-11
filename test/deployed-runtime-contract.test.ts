@@ -113,12 +113,10 @@ test("delivered-result polling finds a successful structured parent message", as
     writeFileSync(join(nested, "session.jsonl"), [
       JSON.stringify({ type: "session", id: "header" }),
       JSON.stringify({
-        type: "message",
-        message: {
-          role: "custom",
-          customType: "subagent_result",
-          details: { name: "Replacement-proof", exitCode: 0 },
-        },
+        type: "custom_message",
+        customType: "subagent_result",
+        details: { name: "Replacement-proof", exitCode: 0 },
+        display: true,
       }),
     ].join("\n"));
     await waitForDeliveredSubagent(dir, "Replacement-proof", 25);
@@ -131,12 +129,10 @@ test("delivered-result polling fails immediately for a matching non-zero result"
   const dir = mkdtempSync(join(tmpdir(), "deployed-runtime-result-failed-"));
   try {
     writeFileSync(join(dir, "session.jsonl"), JSON.stringify({
-      type: "message",
-      message: {
-        role: "custom",
-        customType: "subagent_result",
-        details: { name: "Replacement-failed", exitCode: 9 },
-      },
+      type: "custom_message",
+      customType: "subagent_result",
+      details: { name: "Replacement-failed", exitCode: 9 },
+      display: true,
     }));
     await assert.rejects(
       () => waitForDeliveredSubagent(dir, "Replacement-failed", 25),
