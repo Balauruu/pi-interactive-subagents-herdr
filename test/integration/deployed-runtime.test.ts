@@ -137,7 +137,7 @@ if (liveTestPreflight.status === "disabled") {
       const task = [
         `Use the auto-discovered subagent tool only. In one assistant response, emit exactly ${cap} subagent calls without waiting for or processing any tool result:`,
         ...childCalls,
-        `Do not make any other subagent calls after this batch.`,
+        `Do not make any other subagent calls in this turn.`,
       ].join("\n");
 
       phase = "parent-launch";
@@ -158,7 +158,7 @@ if (liveTestPreflight.status === "disabled") {
       queuePiInput(parentPaneId, [
         `Use the auto-discovered subagent tool exactly once while the existing children remain active.`,
         `Call it with name "Denied-${id}", agent "test-echo", and task "echo DENIED_${id} > '${extraFile}'".`,
-        `Do not retry it or make any other tool call.`,
+        `Do not retry it or make any other tool call in this turn.`,
       ].join(" "));
       await waitForScreen(parentPaneId, /root-tree admission\s+capacity is exhausted/, PI_TIMEOUT, 240);
       assert.equal(existsSync(extraFile), false, "cap+1 must not write a marker while the configured active slots are occupied");
@@ -179,7 +179,7 @@ if (liveTestPreflight.status === "disabled") {
       queuePiInput(parentPaneId, [
         `Use the auto-discovered subagent tool exactly once.`,
         `Call it with name "Replacement-${id}", agent "test-echo", and task "echo REPLACEMENT_${id} > '${replacementFile}'".`,
-        `Do not make any other tool call.`,
+        `Do not make any other tool call in this turn.`,
       ].join(" "));
       await waitForFile(replacementFile, PI_TIMEOUT, new RegExp(`REPLACEMENT_${id}`));
       await waitForScreen(parentPaneId, new RegExp(`✓\\s+Replacement-${id}`), PI_TIMEOUT, 240);
