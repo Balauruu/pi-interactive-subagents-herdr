@@ -6,7 +6,7 @@ export type LiveTestEnvironment = Readonly<Record<string, string | undefined>>;
 
 export type LiveTestPreflight =
   | { status: "disabled" }
-  | { status: "rejected"; variable: "PI_LIVE_TESTS" | "PI_TEST_MODEL" | "HERDR_ENV"; reason: "missing" | "invalid" }
+  | { status: "rejected"; variable: "PI_LIVE_TESTS" | "PI_TEST_MODEL"; reason: "missing" | "invalid" }
   | { status: "ready"; model: string };
 
 const MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:-]*$/;
@@ -27,12 +27,6 @@ export function preflightLiveTest(environment: LiveTestEnvironment): LiveTestPre
   if (!MODEL_IDENTIFIER.test(model)) {
     return { status: "rejected", variable: "PI_TEST_MODEL", reason: "invalid" };
   }
-
-  const herdrContext = environment.HERDR_ENV;
-  if (herdrContext === undefined || herdrContext.length === 0) {
-    return { status: "rejected", variable: "HERDR_ENV", reason: "missing" };
-  }
-  if (herdrContext !== "1") return { status: "rejected", variable: "HERDR_ENV", reason: "invalid" };
 
   return { status: "ready", model };
 }

@@ -9,8 +9,8 @@ import { fileURLToPath } from "node:url";
 import { formatLiveTestPreflightFailure, preflightLiveTest } from "./live-test-guard.ts";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const LIVE_ENTRYPOINTS = ["test:integration", "test:layout:integration", "test:provider:integration"] as const;
-const { PI_LIVE_TESTS: _optIn, PI_TEST_MODEL: _model, HERDR_ENV: _herdr, ...BASE_ENVIRONMENT } = process.env;
+const LIVE_ENTRYPOINTS = ["test:integration", "test:layout:integration", "test:provider:integration", "test:deployed:integration"] as const;
+const { PI_LIVE_TESTS: _optIn, PI_TEST_MODEL: _model, ...BASE_ENVIRONMENT } = process.env;
 
 function assertRejectedEntrypoint(
   entrypoint: (typeof LIVE_ENTRYPOINTS)[number],
@@ -62,21 +62,14 @@ test("does not authorize live tests without the exact opt-in", () => {
 });
 
 test("requires a non-empty provider/model identifier before live side effects", () => {
-  assert.deepEqual(preflightLiveTest({ PI_LIVE_TESTS: "1", HERDR_ENV: "1" }), {
+  assert.deepEqual(preflightLiveTest({ PI_LIVE_TESTS: "1" }), {
     status: "rejected",
     variable: "PI_TEST_MODEL",
     reason: "missing",
   });
   assert.deepEqual(
-    preflightLiveTest({ PI_LIVE_TESTS: "1", PI_TEST_MODEL: "not a model", HERDR_ENV: "1" }),
+    preflightLiveTest({ PI_LIVE_TESTS: "1", PI_TEST_MODEL: "not a model" }),
     { status: "rejected", variable: "PI_TEST_MODEL", reason: "invalid" },
-  );
-});
-
-test("requires Herdr caller context after validating the authorized model", () => {
-  assert.deepEqual(
-    preflightLiveTest({ PI_LIVE_TESTS: "1", PI_TEST_MODEL: "anthropic/claude-haiku-4-5" }),
-    { status: "rejected", variable: "HERDR_ENV", reason: "missing" },
   );
 });
 
@@ -84,21 +77,20 @@ test("rejects blank, malformed, and near-miss authorization values", () => {
   for (const [environment, variable, reason] of [
     [{ PI_LIVE_TESTS: "" }, "PI_LIVE_TESTS", "invalid"],
     [{ PI_LIVE_TESTS: "01" }, "PI_LIVE_TESTS", "invalid"],
-    [{ PI_LIVE_TESTS: "1 ", PI_TEST_MODEL: "provider/model", HERDR_ENV: "1" }, "PI_LIVE_TESTS", "invalid"],
-    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: "", HERDR_ENV: "1" }, "PI_TEST_MODEL", "missing"],
-    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: " ", HERDR_ENV: "1" }, "PI_TEST_MODEL", "invalid"],
-    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: "provider/model/", HERDR_ENV: "1" }, "PI_TEST_MODEL", "invalid"],
+    [{ PI_LIVE_TESTS: "1 ", PI_TEST_MODEL: "provider/model" }, "PI_LIVE_TESTS", "invalid"],
+    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: "" }, "PI_TEST_MODEL", "missing"],
+    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: " " }, "PI_TEST_MODEL", "invalid"],
+    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: "provider/model/" }, "PI_TEST_MODEL", "invalid"],
   ] as const) {
     assert.deepEqual(preflightLiveTest(environment), { status: "rejected", variable, reason });
   }
 });
 
-test("authorizes only an exact opt-in, valid model, and Herdr caller context", () => {
+test("authorizes only an exact opt-in and valid provider/model", () => {
   assert.deepEqual(
     preflightLiveTest({
       PI_LIVE_TESTS: "1",
       PI_TEST_MODEL: "anthropic/claude-haiku-4-5",
-      HERDR_ENV: "1",
     }),
     { status: "ready", model: "anthropic/claude-haiku-4-5" },
   );
@@ -108,7 +100,6 @@ test("rejection text names the invalid variable without echoing its value", () =
   const rejected = preflightLiveTest({
     PI_LIVE_TESTS: "1",
     PI_TEST_MODEL: "secret model value",
-    HERDR_ENV: "1",
   });
   assert.equal(rejected.status, "rejected");
   if (rejected.status === "rejected") {
@@ -123,10 +114,9 @@ test("each live npm entrypoint rejects before test discovery or external helpers
     [{}, "PI_LIVE_TESTS"],
     [{ PI_LIVE_TESTS: "" }, "PI_LIVE_TESTS"],
     [{ PI_LIVE_TESTS: "01" }, "PI_LIVE_TESTS"],
-    [{ PI_LIVE_TESTS: "1", HERDR_ENV: "1" }, "PI_TEST_MODEL"],
-    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: " " , HERDR_ENV: "1" }, "PI_TEST_MODEL"],
-    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: "provider/model/", HERDR_ENV: "1" }, "PI_TEST_MODEL"],
-    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: "provider/model" }, "HERDR_ENV"],
+    [{ PI_LIVE_TESTS: "1" }, "PI_TEST_MODEL"],
+    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: " " }, "PI_TEST_MODEL"],
+    [{ PI_LIVE_TESTS: "1", PI_TEST_MODEL: "provider/model/" }, "PI_TEST_MODEL"],
   ] as const;
 
   for (const [environment, variable] of rejectedEnvironments) {
