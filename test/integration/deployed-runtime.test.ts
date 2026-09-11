@@ -15,6 +15,7 @@ import {
   getAvailableBackends,
   getFocusedSurface,
   paneExists,
+  queuePiInput,
   readPaneLayout,
   readScreen,
   sendPiInput,
@@ -154,7 +155,7 @@ if (liveTestPreflight.status === "disabled") {
       await waitForBalanced(parentPaneId, admissionPaneIds, 20_000);
 
       phase = "admission-rejection";
-      sendPiInput(parentPaneId, [
+      queuePiInput(parentPaneId, [
         `Use the auto-discovered subagent tool exactly once while the existing children remain active.`,
         `Call it with name "Denied-${id}", agent "test-echo", and task "echo DENIED_${id} > '${extraFile}'".`,
         `Do not retry it or make any other tool call.`,
@@ -175,7 +176,7 @@ if (liveTestPreflight.status === "disabled") {
       await waitForPaneCount(parentPaneId, 1, PI_TIMEOUT);
 
       phase = "slot-reuse";
-      sendPiInput(parentPaneId, [
+      queuePiInput(parentPaneId, [
         `Use the auto-discovered subagent tool exactly once.`,
         `Call it with name "Replacement-${id}", agent "test-echo", and task "echo REPLACEMENT_${id} > '${replacementFile}'".`,
         `Do not make any other tool call.`,

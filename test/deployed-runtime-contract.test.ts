@@ -10,6 +10,7 @@ import {
   buildDeployedPiCommand,
   cleanupTestEnv,
   createTestEnv,
+  queuePiInput,
   sendPiInput,
   verifyDeployedRuntimeIdentity,
   waitForFile,
@@ -105,6 +106,7 @@ test("file polling honors its requested timeout when a marker never appears", as
 
 test("deployed Pi input rejects an empty user turn before touching Herdr", () => {
   assert.throws(() => sendPiInput("pane", "  "), /Pi input is required/);
+  assert.throws(() => queuePiInput("pane", "  "), /Pi input is required/);
 });
 
 test("deployed integration command rejects missing live authorization before test discovery", () => {

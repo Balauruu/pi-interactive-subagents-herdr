@@ -360,10 +360,17 @@ export function startDeployedPi(surface: string, options: Omit<DeployedPiCommand
   });
 }
 
-/** Submit a distinct user turn or slash command to an already-running Pi pane. */
+/** Submit a distinct user turn or slash command to an idle Pi pane. */
 export function sendPiInput(surface: string, input: string): void {
   if (!input.trim()) throw new Error("Pi input is required.");
   sendCommand(surface, input);
+}
+
+/** Queue a follow-up user turn through Pi's documented Alt+Enter binding. */
+export function queuePiInput(surface: string, input: string): void {
+  if (!input.trim()) throw new Error("Pi input is required.");
+  execFileSync("herdr", ["pane", "send-text", surface, input], { encoding: "utf8" });
+  execFileSync("herdr", ["pane", "send-keys", surface, "alt+enter"], { encoding: "utf8" });
 }
 
 // ── Polling helpers ──
