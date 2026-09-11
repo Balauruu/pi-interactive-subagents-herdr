@@ -27,8 +27,11 @@ export interface SettlementActions {
 }
 
 function safeError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/[\u0000-\u001f]/g, " ").slice(0, 480) || "unknown lifecycle action failure";
+  // Action errors can contain terminal output, prompts, environment values, or
+  // provider diagnostics. Persist only a stable category, never their text.
+  return error instanceof LifecycleError
+    ? `lifecycle ${error.code}`
+    : "external lifecycle action failed";
 }
 
 function capacityFromEnv(): number {
@@ -90,9 +93,23 @@ async function independentlySettle(
   action: (() => void | Promise<void>) | undefined,
 ): Promise<void> {
   try {
+    const prior = run.coordinator.inspect().children[run.childId]?.transitions[transition];
     const claim = run.coordinator.claimTransition({ childId: run.childId, ownerId: run.ownerId, leaseToken: run.lease.token, transition });
     if (!claim.claimed) return;
     try {
+      // Parent delivery is an externally visible side effect. A rejection after
+      // invocation is ambiguous, so consume the bounded retry rather than risk
+      // sending the same terminal result twice.
+      if (transition === "delivery" && prior?.attempts && prior.lastError) {
+        run.coordinator.completeTransition({
+          childId: run.childId,
+          ownerId: run.ownerId,
+          leaseToken: run.lease.token,
+          transition,
+          error: "delivery retry suppressed after prior failure",
+        });
+        return;
+      }
       if (transition === "release") run.coordinator.releaseLease({ childId: run.childId, ownerId: run.ownerId, leaseToken: run.lease.token });
       else await action?.();
       run.coordinator.completeTransition({ childId: run.childId, ownerId: run.ownerId, leaseToken: run.lease.token, transition });

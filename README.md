@@ -19,6 +19,21 @@ Spawn several in parallel — they run concurrently and steer results back indep
 
 Herdr owns pane layout and focus. The extension submits commands atomically through Herdr and reads the pane's detected terminal output. Up to three right-hand agent columns are rebalanced after each spawn or cleanup. Additional agents split downward from the shortest column. If the terminal is too narrow for equal columns, the main Pi pane keeps the larger share and the remaining space is divided between agent columns. Set `PI_SUBAGENT_MIN_PANE_WIDTH` to change the width threshold; it defaults to `24` columns.
 
+## Root-tree lifecycle and recovery
+
+Every fresh spawn and resumed session first acquires a durable admission lease before a Herdr pane or child process is allocated. The root session ID is propagated through `PI_SUBAGENT_ROOT_ID`, and its artifact boundary through `PI_SUBAGENT_ROOT_ARTIFACT_DIR`, so nested and resumed children share one cap. The root boundary contains `subagent-lifecycle.json`; it is an atomically replaced, root-scoped record, not a provider transcript or prompt store.
+
+Each child record exposes its root and child identity, phase, lease state and timestamps, immutable terminal evidence references, per-transition status and attempts, and the last redacted transition error. Terminal evidence is persisted before extraction, parent delivery, lease release, pane close, or layout. Evidence retains only exit/sentinel/session/transcript references, never prompt text, transcript bodies, provider tokens, or environment values.
+
+Settlement independently claims `extraction`, `delivery`, `release`, `cleanup`, and `layout`. A failure in one action cannot prevent the others, and completed claims are idempotent. Lease release is retried within the coordinator's fixed same-owner budget, while a failed parent-delivery attempt is conservatively not re-sent because a rejection may have occurred after delivery. Pane cleanup remains owner-fenced and layout is always a separate action.
+
+### Troubleshooting lifecycle recovery
+
+1. Inspect the root session's `subagent-lifecycle.json` after an interrupted run. Check the child phase, `lease.state`, terminal evidence, transition attempts, and redacted `lastTransitionError`.
+2. If terminal evidence exists and the lease is still active, resume settlement from the proven owner. It will retry pending release, cleanup, and layout actions independently without replacing terminal evidence.
+3. Do not delete a lock or close a pane when ownership cannot be proven. A malformed state, contended lock, unknown owner, or lease-token mismatch is intentionally left inspectable rather than speculatively recovered.
+4. A delivery transition that exhausted its retry boundary records a redacted failure instead of sending the terminal result again. Resolve it through the parent/session recovery path, then inspect the durable evidence reference.
+
 ## Tools
 
 | Tool | Description |
