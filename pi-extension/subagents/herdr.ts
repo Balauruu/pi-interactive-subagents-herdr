@@ -26,6 +26,7 @@ import {
 } from "./pane-layout.ts";
 
 const execFileAsync = promisify(execFile);
+const HERDR_PANE_PROBE_TIMEOUT = 5_000;
 
 // ── Availability ──
 
@@ -48,10 +49,32 @@ function hasCommand(command: string): boolean {
   return available;
 }
 
-/** True when pi is running in a Herdr-managed pane. */
-export function isMuxAvailable(): boolean {
-  return !!process.env.HERDR_PANE_ID && hasCommand("herdr");
+function currentHerdrPaneIdFromProbe(probe: () => string): string | null {
+  try {
+    const response = JSON.parse(probe());
+    const paneId = response?.result?.pane?.pane_id;
+    return typeof paneId === "string" && paneId.length > 0 ? paneId : null;
+  } catch {
+    return null;
+  }
 }
+
+/** Resolve the current pane through Herdr rather than inherited process variables. */
+export function currentHerdrPaneId(): string | null {
+  if (!hasCommand("herdr")) return null;
+  return currentHerdrPaneIdFromProbe(() => execFileSync(
+    "herdr",
+    ["pane", "current", "--current"],
+    { encoding: "utf8", timeout: HERDR_PANE_PROBE_TIMEOUT },
+  ));
+}
+
+/** True when the Herdr CLI can resolve the caller's current managed pane. */
+export function isMuxAvailable(): boolean {
+  return currentHerdrPaneId() !== null;
+}
+
+export const __herdrTest__ = { currentHerdrPaneIdFromProbe };
 
 export function muxSetupHint(): string {
   return "Start pi inside Herdr (`herdr`).";
@@ -337,8 +360,8 @@ export class PaneLayoutCoordinator {
 
 const layoutCoordinators = new Map<string, PaneLayoutCoordinator>();
 
-export function paneLayoutCoordinator(rootPaneId = process.env.HERDR_PANE_ID): PaneLayoutCoordinator {
-  if (!rootPaneId) throw new Error("HERDR_PANE_ID is not set.");
+export function paneLayoutCoordinator(rootPaneId = currentHerdrPaneId() ?? undefined): PaneLayoutCoordinator {
+  if (!rootPaneId) throw new Error("Herdr current pane is unavailable.");
   let coordinator = layoutCoordinators.get(rootPaneId);
   if (!coordinator) {
     coordinator = new PaneLayoutCoordinator({ rootPaneId });
