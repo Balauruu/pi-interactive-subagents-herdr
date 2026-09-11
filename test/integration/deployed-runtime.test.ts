@@ -100,10 +100,10 @@ if (liveTestPreflight.status === "disabled") {
         `task "Run exactly: echo START_${id}_${index} > '${startFile}'; sleep 12; echo DONE_${id}_${index} > '${doneFiles[index]}'".`,
       ].join(" "));
       const task = [
-        `Use the auto-discovered subagent tool only. Make exactly ${cap} calls immediately before waiting for results:`,
+        `Use the auto-discovered subagent tool only. In one assistant response, emit exactly ${cap + 1} subagent calls without waiting for or processing any tool result:`,
         ...childCalls,
-        `Then make one additional call named "Denied-${id}" with agent "test-echo" and task "echo DENIED_${id} > '${extraFile}'" while the first ${cap} are active.`,
-        `The additional call must be rejected by the configured active-subagent limit. Do not retry it.`,
+        `Call ${cap + 1}: name "Denied-${id}", agent "test-echo", task "echo DENIED_${id} > '${extraFile}'" while the first ${cap} calls are still active.`,
+        `The final call must be rejected by the configured active-subagent limit. Do not retry it or make any other subagent call until every result from this batch arrives.`,
         `After all successful child results arrive, make one replacement call named "Replacement-${id}" with agent "test-echo" and task "echo REPLACEMENT_${id} > '${replacementFile}'".`,
         `After its result arrives, print exactly DEPLOYED_PARENT_COMPLETE_${id} and RESULT_DELIVERED_${id}.`,
       ].join("\n");
