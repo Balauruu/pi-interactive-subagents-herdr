@@ -166,12 +166,13 @@ if (liveTestPreflight.status === "disabled") {
         new Set(admissionPaneIds),
         "cap+1 rejection must not allocate another child pane",
       );
+      const initialDeliveryProofs = startFiles.map((_, index) =>
+        waitForScreen(parentPaneId, new RegExp(`✓\\s+Deploy-${id}-${index}`), PI_TIMEOUT, 240));
       writeFileSync(releaseFile, `RELEASE_${id}\n`);
 
       phase = "delivery-and-release";
       await Promise.all(doneFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`DONE_${id}_${index}`))));
-      await Promise.all(startFiles.map((_, index) =>
-        waitForScreen(parentPaneId, new RegExp(`✓\\s+Deploy-${id}-${index}`), PI_TIMEOUT, 240)));
+      await Promise.all(initialDeliveryProofs);
       await waitForPaneCount(parentPaneId, 1, PI_TIMEOUT);
 
       phase = "slot-reuse";
