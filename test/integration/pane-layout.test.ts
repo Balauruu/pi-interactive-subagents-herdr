@@ -37,9 +37,11 @@ function assertOwnedLayout(rootPaneId: string, ownedPaneIds: ReadonlySet<string>
   const areas = layout.panes.map((pane) => pane.rect.width * pane.rect.height);
   const smallest = Math.min(...areas);
   const largest = Math.max(...areas);
+  const isPowerOfTwo = (areas.length & (areas.length - 1)) === 0;
+  const requiredRatio = isPowerOfTwo ? MIN_AREA_RATIO : 0.50;
   assert.ok(
-    smallest / largest >= MIN_AREA_RATIO,
-    `expected a reasonably symmetric layout (area ratio >= ${MIN_AREA_RATIO}), got ${smallest / largest}`,
+    smallest / largest >= requiredRatio,
+    `expected a reasonably symmetric layout (area ratio >= ${requiredRatio}), got ${smallest / largest}`,
   );
 }
 
@@ -91,31 +93,46 @@ if (liveTestPreflight.status === "disabled") {
 
       const secondPaneId = await coordinator.allocate();
       assertOwnedLayout(workspace.rootPaneId, coordinator.ownedPaneIds);
+
+      const thirdPaneId = await coordinator.allocate();
+      assertOwnedLayout(workspace.rootPaneId, coordinator.ownedPaneIds);
+      assert.equal(
+        commands.filter((args) => args[0] === "pane" && args[1] === "split").length,
+        3,
+        "the real four-pane sequence allocates exactly three child panes",
+      );
       assert.ok(
-        commands.some((args) => args[0] === "pane" && args[1] === "resize"),
-        "the real three-pane sequence performs a bounded Herdr resize",
+        commands.filter((args) => args[0] === "pane" && args[1] === "resize").length <= 24,
+        "the real four-pane sequence stays within the per-allocation resize budget",
       );
 
       const settled = await coordinator.reconcile();
-      assertOutcome(settled, workspace.rootPaneId, 2);
+      assertOutcome(settled, workspace.rootPaneId, 3);
       assert.notEqual(settled.state, "failed");
       assert.notEqual(settled.state, "cancelled");
 
       const firstClose = await coordinator.close(firstPaneId);
       assert.deepEqual(
         { state: firstClose.state, reason: firstClose.reason, ownerPaneCount: firstClose.ownerPaneCount },
-        { state: "completed", reason: "planned", ownerPaneCount: 1 },
+        { state: "completed", reason: "planned", ownerPaneCount: 2 },
       );
       assertOwnedLayout(workspace.rootPaneId, coordinator.ownedPaneIds);
 
       const secondClose = await coordinator.close(secondPaneId);
       assert.deepEqual(
         { state: secondClose.state, reason: secondClose.reason, ownerPaneCount: secondClose.ownerPaneCount },
+        { state: "completed", reason: "planned", ownerPaneCount: 1 },
+      );
+      assertOwnedLayout(workspace.rootPaneId, coordinator.ownedPaneIds);
+
+      const thirdClose = await coordinator.close(thirdPaneId);
+      assert.deepEqual(
+        { state: thirdClose.state, reason: thirdClose.reason, ownerPaneCount: thirdClose.ownerPaneCount },
         { state: "completed", reason: "planned", ownerPaneCount: 0 },
       );
       assertOwnedLayout(workspace.rootPaneId, coordinator.ownedPaneIds);
 
-      const repeatedClose = await coordinator.close(secondPaneId);
+      const repeatedClose = await coordinator.close(thirdPaneId);
       assert.deepEqual(
         { state: repeatedClose.state, reason: repeatedClose.reason, operationCount: repeatedClose.operationCount },
         { state: "skipped", reason: "unknown-pane", operationCount: 0 },

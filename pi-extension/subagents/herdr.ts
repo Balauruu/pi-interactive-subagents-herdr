@@ -89,10 +89,12 @@ export interface PaneLayoutCoordinatorOptions {
   executor?: HerdrExecutor;
   commandTimeoutMs?: number;
   maxOperations?: number;
+  minimumAreaRatio?: number;
 }
 
 const DEFAULT_LAYOUT_COMMAND_TIMEOUT_MS = 3_000;
 const DEFAULT_LAYOUT_OPERATION_BUDGET = 8;
+const DEFAULT_MINIMUM_AREA_RATIO = 0.60;
 
 function commandReason(error: unknown, signal?: AbortSignal): PaneLayoutOutcome["reason"] {
   if (signal?.aborted || (error as { name?: string } | undefined)?.name === "AbortError") return "aborted";
@@ -172,6 +174,7 @@ export class PaneLayoutCoordinator {
   #executor: HerdrExecutor;
   #timeoutMs: number;
   #maxOperations: number;
+  #minimumAreaRatio: number;
   #reconciliation: Promise<PaneLayoutOutcome> | undefined;
 
   constructor(options: PaneLayoutCoordinatorOptions) {
@@ -179,6 +182,7 @@ export class PaneLayoutCoordinator {
     this.#executor = options.executor ?? createHerdrExecutor();
     this.#timeoutMs = options.commandTimeoutMs ?? DEFAULT_LAYOUT_COMMAND_TIMEOUT_MS;
     this.#maxOperations = options.maxOperations ?? DEFAULT_LAYOUT_OPERATION_BUDGET;
+    this.#minimumAreaRatio = options.minimumAreaRatio ?? DEFAULT_MINIMUM_AREA_RATIO;
   }
 
   get rootPaneId(): string {
@@ -262,31 +266,45 @@ export class PaneLayoutCoordinator {
   }
 
   async #reconcile(signal?: AbortSignal): Promise<PaneLayoutOutcome> {
-    const read = await this.#snapshot(signal);
-    if (read.outcome) return read.outcome;
-    const plan = planPaneReconciliation(this.#ownership, read.snapshot, {
-      signal,
-      maxOperations: this.#maxOperations,
-    });
-    if (plan.state !== "completed" || plan.reason !== "planned") return outcomeFromPlan(plan);
-
     let completed = 0;
-    for (const operation of plan.operations) {
-      if (operation.kind !== "resize") continue;
-      // Herdr resizes by fraction. Derive a capped one-step correction from
-      // this validated measurement and never loop toward convergence.
-      const parsed = parseHerdrPaneLayout(read.snapshot);
-      const current = parsed.ok ? parsed.layout.panes.find((pane) => pane.paneId === operation.paneId) : undefined;
-      const currentArea = current ? current.rect.width * current.rect.height : operation.targetArea;
-      const amount = Math.min(0.25, Math.max(0.01, Math.abs(operation.targetArea - currentArea) / operation.targetArea));
-      const failed = await this.#run([
-        "pane", "resize", "--pane", operation.paneId, "--direction", operation.direction,
-        "--amount", amount.toFixed(4),
-      ], signal);
-      if (failed) return { ...failed, operationCount: completed + failed.operationCount };
-      completed++;
+    for (;;) {
+      const read = await this.#snapshot(signal);
+      if (read.outcome) return { ...read.outcome, operationCount: completed + read.outcome.operationCount };
+      const plan = planPaneReconciliation(this.#ownership, read.snapshot, {
+        signal,
+        maxOperations: this.#maxOperations - completed,
+      });
+      if (plan.state !== "completed" || plan.reason !== "planned") {
+        return { ...outcomeFromPlan(plan), operationCount: completed + plan.operationCount };
+      }
+      const parsedLayout = parseHerdrPaneLayout(read.snapshot);
+      if (parsedLayout.ok) {
+        const areas = parsedLayout.layout.panes.map((pane) => pane.rect.width * pane.rect.height);
+        const ratio = Math.min(...areas) / Math.max(...areas);
+        const isPowerOfTwo = (areas.length & (areas.length - 1)) === 0;
+        const requiredRatio = isPowerOfTwo ? this.#minimumAreaRatio : Math.min(this.#minimumAreaRatio, 0.50);
+        if (ratio >= requiredRatio) {
+          return { ...outcomeFromPlan(plan), reason: "already-balanced", operationCount: completed };
+        }
+      }
+
+      for (const operation of plan.operations) {
+        if (operation.kind !== "resize") continue;
+        // Herdr resizes by fraction. Each correction uses the round's fresh,
+        // validated snapshot; later rounds converge within one shared budget.
+        const parsed = parseHerdrPaneLayout(read.snapshot);
+        const current = parsed.ok ? parsed.layout.panes.find((pane) => pane.paneId === operation.paneId) : undefined;
+        const currentArea = current ? current.rect.width * current.rect.height : operation.targetArea;
+        const amount = Math.min(0.25, Math.max(0.01, Math.abs(operation.targetArea - currentArea) / operation.targetArea));
+        const failed = await this.#run([
+          "pane", "resize", "--pane", operation.paneId, "--direction", operation.direction,
+          "--amount", amount.toFixed(4),
+        ], signal);
+        if (failed) return { ...failed, operationCount: completed + failed.operationCount };
+        completed++;
+      }
+      if (completed >= this.#maxOperations) return { ...outcomeFromPlan(plan), operationCount: completed };
     }
-    return { ...outcomeFromPlan(plan), operationCount: completed };
   }
 
   /** Close only a pane registered from a successful split. Repeated closes are safe no-ops. */

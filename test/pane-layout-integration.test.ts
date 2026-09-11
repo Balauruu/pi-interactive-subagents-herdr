@@ -107,6 +107,22 @@ describe("async owner-safe Herdr pane coordinator", () => {
     assert.ok(coordinator.ownedPaneIds.has(secondPane));
   });
 
+  it("reconciles fresh snapshots repeatedly within one shared operation budget", async () => {
+    const fake = new FakeHerdr();
+    const coordinator = new PaneLayoutCoordinator({ rootPaneId: ROOT, executor: fake, maxOperations: 3 });
+    await coordinator.allocate();
+    fake.calls.length = 0;
+    fake.skew = true;
+
+    const outcome = await coordinator.reconcile();
+
+    assert.equal(outcome.state, "completed");
+    assert.equal(outcome.reason, "planned");
+    assert.equal(outcome.operationCount, 3);
+    assert.equal(callsFor(fake, "resize").length, 3);
+    assert.equal(callsFor(fake, "layout").length, 3);
+  });
+
   it("coalesces concurrent reconciliation and treats malformed, abort, timeout, and transient failures as bounded outcomes", async () => {
     const fake = new FakeHerdr();
     const coordinator = new PaneLayoutCoordinator({ rootPaneId: ROOT, executor: fake });
