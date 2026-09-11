@@ -16,7 +16,9 @@
     "test": "node --test test/test.ts test/*.test.ts",
     "test:integration": "node test/live-test-entrypoint.ts && node --test --test-concurrency=1 test/integration/*.test.ts",
     "test:layout:integration": "node test/live-test-entrypoint.ts && node --test --test-concurrency=1 test/integration/pane-layout.test.ts",
-    "test:provider:integration": "node test/live-test-entrypoint.ts && node --test --test-concurrency=1 --test-name-pattern=\"spawns a subagent that writes a file and verifies the session\" test/integration/subagent-lifecycle.test.ts"
+    "test:provider:integration": "node test/live-test-entrypoint.ts && node --test --test-concurrency=1 --test-name-pattern=\"spawns a subagent that writes a file and verifies the session\" test/integration/subagent-lifecycle.test.ts",
+    "test:deploy": "node --test test/deploy-active-package.test.ts",
+    "deploy:active-package": "node scripts/deploy-active-package.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
