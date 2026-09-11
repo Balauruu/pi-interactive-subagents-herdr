@@ -1335,6 +1335,7 @@ async function launchSubagent(
     artifactDir,
     childId: `child-${id}`,
     ownerId: `owner-${id}`,
+    maxActiveSubagents: extensionConfig!.maxActiveSubagents,
   });
   lifecycleRuns.set(id, lifecycle);
   markLifecycleRunning(lifecycle);
@@ -2370,6 +2371,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           artifactDir,
           childId: `resume-${id}`,
           ownerId: `owner-${id}`,
+          maxActiveSubagents: extensionConfig!.maxActiveSubagents,
         });
         lifecycleRuns.set(id, lifecycle);
         markLifecycleRunning(lifecycle);
