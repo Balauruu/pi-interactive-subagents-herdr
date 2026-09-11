@@ -22,6 +22,7 @@ import {
   verifyDeployedRuntimeIdentity,
   waitForFile,
   waitForPiExit,
+  waitForSessionContent,
   waitForScreen,
 } from "./harness.ts";
 
@@ -103,8 +104,7 @@ if (liveTestPreflight.status === "disabled") {
         `Use the auto-discovered subagent tool only. Make exactly ${cap} calls immediately before waiting for results:`,
         ...childCalls,
         `Then make one additional call named "Denied-${id}" with agent "test-echo" and task "echo DENIED_${id} > '${extraFile}'" while the first ${cap} are active.`,
-        `The additional call must be rejected by the configured active-subagent limit. Do not retry it. After its tool result reports that rejection, print exactly DEPLOYED_ADMISSION_REJECTED_${id}.`,
-        `Never print DEPLOYED_ADMISSION_REJECTED_${id} if the additional call was accepted.`,
+        `The additional call must be rejected by the configured active-subagent limit. Do not retry it.`,
         `After all successful child results arrive, make one replacement call named "Replacement-${id}" with agent "test-echo" and task "echo REPLACEMENT_${id} > '${replacementFile}'".`,
         `After its result arrives, print exactly DEPLOYED_PARENT_COMPLETE_${id} and RESULT_DELIVERED_${id}.`,
       ].join("\n");
@@ -119,7 +119,7 @@ if (liveTestPreflight.status === "disabled") {
 
       phase = "admission";
       await Promise.all(startFiles.map((file, index) => waitForFile(file, PI_TIMEOUT, new RegExp(`START_${id}_${index}`))));
-      await waitForScreen(parentPaneId, new RegExp(`DEPLOYED_ADMISSION_REJECTED_${id}`), PI_TIMEOUT, 180);
+      await waitForSessionContent(env.sessionDir, /root-tree admission capacity is exhausted/, PI_TIMEOUT);
       assert.equal(existsSync(extraFile), false, "cap+1 must be rejected before a child process can write its marker");
       assertBalanced(parentPaneId);
       assert.equal(readPaneLayout(parentPaneId).panes.length, cap + 1, "cap+1 must not allocate another child pane");

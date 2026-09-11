@@ -12,6 +12,7 @@ import {
   createTestEnv,
   verifyDeployedRuntimeIdentity,
   waitForFile,
+  waitForSessionContent,
 } from "./integration/harness.ts";
 
 const REPOSITORY = "github.com/Balauruu/pi-interactive-subagents-herdr";
@@ -100,6 +101,43 @@ test("file polling honors its requested timeout when a marker never appears", as
   const started = Date.now();
   await assert.rejects(() => waitForFile(missing, 25), /Timeout \(25ms\)/);
   assert.ok(Date.now() - started < 250, "polling must not sleep past its bounded timeout");
+});
+
+test("session transcript polling detects the persisted admission error without rendering it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "deployed-runtime-session-"));
+  try {
+    const nested = join(dir, "cwd", "session.jsonl");
+    mkdirSync(join(dir, "cwd"), { recursive: true });
+    writeFileSync(nested, '{"type":"tool_result","error":"root-tree admission capacity is exhausted"}\n');
+    const transcript = await waitForSessionContent(dir, /root-tree admission capacity is exhausted/, 25);
+    assert.match(transcript, /root-tree admission capacity is exhausted/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session transcript polling limits each scan to one MiB", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "deployed-runtime-session-bounded-"));
+  try {
+    writeFileSync(join(dir, "session.jsonl"), `${"x".repeat(1024 * 1024)}root-tree admission capacity is exhausted`);
+    await assert.rejects(
+      () => waitForSessionContent(dir, /root-tree admission capacity is exhausted/, 25),
+      /Timeout \(25ms\)/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session transcript polling honors its requested timeout", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "deployed-runtime-session-missing-"));
+  try {
+    const started = Date.now();
+    await assert.rejects(() => waitForSessionContent(dir, /root-tree admission capacity is exhausted/, 25), /Timeout \(25ms\)/);
+    assert.ok(Date.now() - started < 250, "session polling must not sleep past its bounded timeout");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("deployed integration command rejects missing live authorization before test discovery", () => {
