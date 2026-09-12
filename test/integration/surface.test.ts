@@ -179,13 +179,10 @@ for (const backend of backends) {
       await sleep(2000);
 
       const screen = readScreen(surface, 50);
+      const unwrappedScreen = screen.replace(/\s/g, "");
       assert.ok(
-        screen.includes(`LONG_${marker}`),
-        `Expected long command output. Got:\n${screen.slice(0, 300)}...`,
-      );
-      assert.ok(
-        screen.includes("_END"),
-        `Expected full output (not truncated). Got:\n${screen.slice(-300)}`,
+        unwrappedScreen.includes(`LONG_${marker}_${longValue}_END`),
+        `Expected complete long command output after removing visual line wraps. Got:\n${screen}`,
       );
     });
 
