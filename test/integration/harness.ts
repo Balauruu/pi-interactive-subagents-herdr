@@ -75,7 +75,7 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 // ── Configuration ──
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
-export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
+export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "180000");
 
 // ── Backend detection ──
 

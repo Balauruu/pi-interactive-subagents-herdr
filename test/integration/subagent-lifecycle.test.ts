@@ -7,7 +7,7 @@
  * outcome via marker files and screen output.
  *
  * Duration: ~30-90s per test. Override the bounded per-test timeout with
- * PI_TEST_TIMEOUT (default: 120000).
+ * PI_TEST_TIMEOUT (default: 180000).
  *
  * Run inside Herdr:
  *   npm run test:provider:integration
