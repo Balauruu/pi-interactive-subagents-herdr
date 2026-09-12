@@ -1,0 +1,20 @@
+{
+  "id": "ac1dee89-f201-4692-8e16-9f638fc44293",
+  "runtime": "bash",
+  "purpose": "M001/S05/T04 authorized provider integration smoke",
+  "script_chars": 808,
+  "started_at": "2026-09-11T12:39:28.231Z",
+  "finished_at": "2026-09-11T12:39:28.235Z",
+  "exit_code": 64,
+  "signal": null,
+  "timed_out": false,
+  "aborted": false,
+  "force_resolved": false,
+  "duration_ms": 4,
+  "stdout_bytes": 0,
+  "stderr_bytes": 70,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "stdout_path": "/home/balauru/.pi/agent/git/github.com/Balauruu/pi-interactive-subagents-herdr/.gsd/exec/ac1dee89-f201-4692-8e16-9f638fc44293.stdout",
+  "stderr_path": "/home/balauru/.pi/agent/git/github.com/Balauruu/pi-interactive-subagents-herdr/.gsd/exec/ac1dee89-f201-4692-8e16-9f638fc44293.stderr"
+}

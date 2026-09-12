@@ -4,8 +4,7 @@
  * These tests exercise real Herdr operations: creating panes, sending commands,
  * reading screen output, and closing panes. No LLM calls - fast and free.
  *
- * Run inside Herdr:
- *   herdr
+ * Run from an active Herdr caller context:
  *   npm run test:integration
  */
 import { describe, it, before, after, afterEach } from "node:test";
@@ -34,9 +33,11 @@ import {
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
+
 if (backends.length === 0) {
-  console.log("⚠️  Herdr is not available - skipping Herdr surface integration tests");
-  console.log("   Run inside Herdr to enable these tests.");
+  it("Herdr surface integration requires available infrastructure", () =>
+    assert.fail("Herdr infrastructure is unavailable."),
+  );
 }
 
 for (const backend of backends) {
@@ -47,31 +48,31 @@ for (const backend of backends) {
       env = createTestEnv();
     });
 
-    afterEach(() => {
+    afterEach(async () => {
       for (const surface of env.surfaces) {
         try {
-          closeSurface(surface);
+          await closeSurface(surface);
         } catch {}
       }
       env.surfaces = [];
     });
 
-    after(() => {
-      cleanupTestEnv(env);
+    after(async () => {
+      await cleanupTestEnv(env);
     });
 
     it("keeps focus on the parent while Herdr creates non-focused panes", async () => {
       const initialFocus = getFocusedSurface();
       assert.ok(initialFocus, "The test runner should have a focused Herdr pane");
-      createTrackedSurfaceSplit(env, "focus-anchor", "right");
+      await createTrackedSurfaceSplit(env, "focus-anchor", "right");
       await sleep(1000);
       assert.equal(getFocusedSurface(), initialFocus);
 
-      const childA = createTrackedSurface(env, "focus-child-a");
+      const childA = await createTrackedSurface(env, "focus-child-a");
       await sleep(1000);
       assert.equal(getFocusedSurface(), initialFocus);
 
-      const childB = createTrackedSurface(env, "focus-child-b");
+      const childB = await createTrackedSurface(env, "focus-child-b");
       await sleep(1000);
       assert.equal(getFocusedSurface(), initialFocus);
 
@@ -87,54 +88,48 @@ for (const backend of backends) {
       assert.equal(getFocusedSurface(), initialFocus);
     });
 
-    it("balances right-hand panes into equal columns", () => {
+    it("returns validated rectangles for coordinator-owned panes", async () => {
       const parent = getFocusedSurface();
       assert.ok(parent, "The test runner should have a focused Herdr pane");
       const surfaces = [
-        createTrackedSurface(env, "balance-1"),
-        createTrackedSurface(env, "balance-2"),
-        createTrackedSurface(env, "balance-3"),
+        await createTrackedSurface(env, "balance-1"),
+        await createTrackedSurface(env, "balance-2"),
+        await createTrackedSurface(env, "balance-3"),
       ];
 
       const response = JSON.parse(
         execFileSync("herdr", ["pane", "layout", "--pane", parent], { encoding: "utf8" }),
       );
       const layout = response.result.layout;
-      const widths = [parent, ...surfaces].map(
-        (pane) => layout.panes.find((entry: any) => entry.pane_id === pane)?.rect.width,
-      );
-
-      assert.ok(widths.every((width) => typeof width === "number"));
-      assert.ok(
-        widths.every((width) => width === widths[0]),
-        `Expected equal pane widths, got ${widths.join(", ")}`,
-      );
+      for (const pane of [parent, ...surfaces]) {
+        const rect = layout.panes.find((entry: any) => entry.pane_id === pane)?.rect;
+        assert.ok(rect, `Expected layout rect for ${pane}`);
+        assert.ok(rect.width > 0 && rect.height > 0, `Expected positive layout dimensions for ${pane}`);
+      }
     });
 
-    it("stacks agents vertically after three horizontal agent columns", () => {
+    it("keeps four coordinator-owned panes measurable after repeated allocation", async () => {
       const parent = getFocusedSurface();
       assert.ok(parent, "The test runner should have a focused Herdr pane");
-      const surfaces = Array.from({ length: 4 }, (_, index) =>
-        createTrackedSurface(env, `placement-${index + 1}`),
-      );
+      const surfaces: string[] = [];
+      for (let index = 0; index < 4; index++) {
+        surfaces.push(await createTrackedSurface(env, `placement-${index + 1}`));
+      }
 
       const response = JSON.parse(
         execFileSync("herdr", ["pane", "layout", "--pane", parent], { encoding: "utf8" }),
       );
       const panes = response.result.layout.panes;
-      const rects = surfaces.map((pane) => {
+      for (const pane of surfaces) {
         const rect = panes.find((entry: any) => entry.pane_id === pane)?.rect;
         assert.ok(rect, `Expected layout rect for ${pane}`);
-        return rect;
-      });
-
-      assert.equal(new Set(rects.slice(0, 3).map((rect) => rect.x)).size, 3);
-      assert.equal(rects[3].x, rects[0].x);
-      assert.notEqual(rects[3].y, rects[0].y);
+        assert.ok(Number.isFinite(rect.x) && Number.isFinite(rect.y));
+        assert.ok(rect.width > 0 && rect.height > 0);
+      }
     });
 
     it("creates a surface, sends a command, reads output, and closes it", async () => {
-      const surface = createTrackedSurface(env, "echo-test");
+      const surface = await createTrackedSurface(env, "echo-test");
       await sleep(1000);
 
       const marker = uniqueId();
@@ -147,12 +142,12 @@ for (const backend of backends) {
         `Expected screen to contain MARKER_${marker}. Got:\n${screen}`,
       );
 
-      closeSurface(surface);
+      await closeSurface(surface);
       untrackSurface(env, surface);
     });
 
     it("preserves shell special characters in echo output", async () => {
-      const surface = createTrackedSurface(env, "escape-test");
+      const surface = await createTrackedSurface(env, "escape-test");
       await sleep(1000);
 
       const marker = uniqueId();
@@ -173,7 +168,7 @@ for (const backend of backends) {
     });
 
     it("sends a long command via script file without truncation", async () => {
-      const surface = createTrackedSurface(env, "long-cmd-test");
+      const surface = await createTrackedSurface(env, "long-cmd-test");
       await sleep(1000);
 
       const marker = uniqueId();
@@ -184,18 +179,15 @@ for (const backend of backends) {
       await sleep(2000);
 
       const screen = readScreen(surface, 50);
+      const unwrappedScreen = screen.replace(/\s/g, "");
       assert.ok(
-        screen.includes(`LONG_${marker}`),
-        `Expected long command output. Got:\n${screen.slice(0, 300)}...`,
-      );
-      assert.ok(
-        screen.includes("_END"),
-        `Expected full output (not truncated). Got:\n${screen.slice(-300)}`,
+        unwrappedScreen.includes(`LONG_${marker}_${longValue}_END`),
+        `Expected complete long command output after removing visual line wraps. Got:\n${screen}`,
       );
     });
 
     it("reads screen asynchronously", async () => {
-      const surface = createTrackedSurface(env, "async-read-test");
+      const surface = await createTrackedSurface(env, "async-read-test");
       await sleep(1000);
 
       const marker = uniqueId();
@@ -210,8 +202,8 @@ for (const backend of backends) {
     });
 
     it("manages multiple surfaces concurrently", async () => {
-      const s1 = createTrackedSurface(env, "multi-1");
-      const s2 = createTrackedSurface(env, "multi-2");
+      const s1 = await createTrackedSurface(env, "multi-1");
+      const s2 = await createTrackedSurface(env, "multi-2");
       await sleep(1500);
 
       const m1 = uniqueId();
@@ -228,7 +220,7 @@ for (const backend of backends) {
     });
 
     it("writes output to a file and verifies via surface", async () => {
-      const surface = createTrackedSurface(env, "file-test");
+      const surface = await createTrackedSurface(env, "file-test");
       await sleep(1000);
 
       const marker = uniqueId();

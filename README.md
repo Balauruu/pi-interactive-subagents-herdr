@@ -6,7 +6,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own Herdr pane without stealing keyboard focus. The first three agent panes form columns to the right of the parent Pi pane; additional agents are distributed vertically across those columns. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own Herdr pane without stealing keyboard focus. A root-scoped coordinator selects safe split sources and bounded rebalancing from the current proven pane geometry. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +17,44 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Herdr owns pane layout and focus. The extension submits commands atomically through Herdr and reads the pane's detected terminal output. Up to three right-hand agent columns are rebalanced after each spawn or cleanup. Additional agents split downward from the shortest column. If the terminal is too narrow for equal columns, the main Pi pane keeps the larger share and the remaining space is divided between agent columns. Set `PI_SUBAGENT_MIN_PANE_WIDTH` to change the width threshold; it defaults to `24` columns.
+Herdr owns pane layout and focus. The extension submits commands atomically through Herdr and reads the pane's detected terminal output. Each root-scoped coordinator trusts only its original root pane and child IDs returned by its own successful splits. It selects the largest proven pane and its longest usable axis, then performs at most one bounded reconciliation pass. It never changes a foreign, stale, or unproven pane.
+
+## Root-tree lifecycle and recovery
+
+Every fresh spawn and resumed session first acquires a durable admission lease before a Herdr pane or child process is allocated. The root session ID is propagated through `PI_SUBAGENT_ROOT_ID`, and its artifact boundary through `PI_SUBAGENT_ROOT_ARTIFACT_DIR`, so nested and resumed children share one cap. The root boundary contains `subagent-lifecycle.json`; it is an atomically replaced, root-scoped record, not a provider transcript or prompt store.
+
+Each child record exposes its root and child identity, phase, lease state and timestamps, immutable terminal evidence references, per-transition status and attempts, and the last redacted transition error. Terminal evidence is persisted before extraction, parent delivery, lease release, pane close, or layout. Evidence retains only exit/sentinel/session/transcript references, never prompt text, transcript bodies, provider tokens, or environment values.
+
+Settlement independently claims `extraction`, `delivery`, `release`, `cleanup`, and `layout`. A failure in one action cannot prevent the others, and completed claims are idempotent. Lease release is retried within the coordinator's fixed same-owner budget, while a failed parent-delivery attempt is conservatively not re-sent because a rejection may have occurred after delivery. Pane cleanup remains owner-fenced and layout is always a separate action.
+
+### Troubleshooting lifecycle recovery
+
+1. Inspect the root session's `subagent-lifecycle.json` after an interrupted run. Check the child phase, `lease.state`, terminal evidence, transition attempts, and redacted `lastTransitionError`.
+2. If terminal evidence exists and the lease is still active, resume settlement from the proven owner. It will retry pending release, cleanup, and layout actions independently without replacing terminal evidence.
+3. Do not delete a lock or close a pane when ownership cannot be proven. A malformed state, contended lock, unknown owner, or lease-token mismatch is intentionally left inspectable rather than speculatively recovered.
+4. A delivery transition that exhausted its retry boundary records a redacted failure instead of sending the terminal result again. Resolve it through the parent/session recovery path, then inspect the durable evidence reference.
+
+## Pane layout verification
+
+A reconciliation returns only a structured, redacted outcome: root ID, owned-pane count, operation count, state, and stable reason. It does not retain raw Herdr output. The coordinator uses argv-based `execFile` calls, a three-second command timeout, `AbortSignal` propagation, root-scoped reconciliation coalescing, and a fixed eight-operation budget. Split failure rejects a launch. Layout or cleanup failure remains a separately recorded retryable lifecycle action and never blocks evidence delivery or admission release.
+
+The real-CLI suite creates a unique no-focus Herdr workspace rooted in a temporary directory, performs split, layout, bounded resize, and owned close operations, then closes the workspace and removes that directory in `finally` cleanup. It verifies that the caller pane remains unchanged and accepts a minimum pane-area ratio of `0.60` as reasonably symmetric after representative spawn and cleanup sequences. This permits Herdr's single bounded fractional correction while rejecting an unchanged 1:2 split.
+
+Live integration entrypoints use the invoking Pi installation's configured model resolution, credentials, and available Herdr capabilities. Run them only from a Herdr-managed Pi session. Each suite uses isolated temporary sessions and workspaces, bounded timeouts, and `finally` cleanup. Missing Herdr infrastructure fails before test resources are allocated.
+
+Run the real workspace suite:
+
+```bash
+npm run test:layout:integration
+```
+
+Run one bounded provider-backed smoke test:
+
+```bash
+npm run test:provider:integration
+```
+
+The provider command runs only the basic spawn-and-completion case. `npm test` remains the offline verification for the planner and failure/cancellation paths. `npm run test:deployed:integration` proves normal package discovery, source identity, admission, delivery, slot release, and owner-safe pane cleanup against the active deployment.
 
 ## Tools
 
@@ -27,9 +64,8 @@ Herdr owns pane layout and focus. The extension submits commands atomically thro
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
-| `ask_user_question` | Ask the user a structured question with selectable options (from a separately installed extension) |
 
-`pi-web-access` provides `web_search`, `fetch_content`, `source_check`, and `get_search_content`; `@juicesharp/rpiv-ask-user-question` provides `ask_user_question`. Both are separately installed extensions. The existing `ask_question` flow remains sub-agent-to-orchestrator; `ask_user_question` is a separate user-facing tool. Restricted children disable extension discovery and explicitly load these package extensions when present in the project `.pi/npm`, configured agent `npm`, or global agent `npm` package root, searched in that order (the default global root is `~/.pi/agent/npm`). Install them in one of those roots before listing their tools.
+`pi-web-access` provides `web_search`, `fetch_content`, `source_check`, and `get_search_content`. Restricted children disable extension discovery and explicitly load package extensions when present in the project `.pi/npm`, configured agent `npm`, or global agent `npm` package root, searched in that order (the default global root is `~/.pi/agent/npm`). Install them in one of those roots before listing their tools.
 
 There is also a `/subagent <agent> <task>` command for spawning directly.
 
@@ -73,9 +109,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openai-codex/gpt-5.6-luna` (max) | `read`, `grep`, `find`, `ls`, `ask_question`, `ask_user_question` | Fast read-only codebase recon |
-| **researcher** | `openai-codex/gpt-5.6-luna` (max) | `web_search`, `fetch_content`, `safe_bash`, `ask_question`, `ask_user_question` | Web research, synthesized into a sourced brief |
-| **worker** | `openai-codex/gpt-5.6-luna` (max) | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `ask_question`, `ask_user_question` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | `openai-codex/gpt-5.6-luna` (max) | `read`, `grep`, `find`, `ls`, `ask_question` | Fast read-only codebase recon |
+| **researcher** | `openai-codex/gpt-5.6-luna` (max) | `web_search`, `fetch_content`, `safe_bash`, `ask_question` | Web research, synthesized into a sourced brief |
+| **worker** | `openai-codex/gpt-5.6-luna` (max) | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `ask_question` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
@@ -89,7 +125,7 @@ name: my-agent
 description: Does something specific
 model: openai-codex/gpt-5.6-luna
 thinking: max
-tools: read, edit, write, safe_bash, web_search, fetch_content, ask_question, ask_user_question
+tools: read, edit, write, safe_bash, web_search, fetch_content, ask_question
 session-mode: lineage-only
 auto-exit: true
 ---
@@ -105,7 +141,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash`, `ask_user_question`, `video_extract`, `youtube_search`, `google_image_search`. The subagent control tool `ask_question` and the user-facing `ask_user_question` entry are added to restricted children automatically; `ask_user_question` requires its separately installed extension. Only the extensions backing the requested or automatically granted tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. The control tool `ask_question` is added to restricted children automatically. Only the extensions backing the requested or automatically granted tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -137,7 +173,7 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the allowed tools are loaded back in explicitly. There is no default toolset and no deny-list — a restricted agent gets its frontmatter tools plus the automatically granted question tools. The restriction survives resume via the loadout snapshot.
+Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the allowed tools are loaded back in explicitly. There is no default toolset and no deny-list — a restricted agent gets its frontmatter tools plus the automatically granted `ask_question` control tool. The restriction survives resume via the loadout snapshot.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
@@ -164,13 +200,17 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
+The extension reads exactly one user-owned policy file: package-root `config.json` (copy `config.json.example`; it is gitignored). It must be a plain JSON object with **exactly** these keys. There are no defaults, example-file fallback, nested legacy status policy, or unknown keys. Initialization fails with the file and offending key when the file is absent, malformed, or invalid.
 
 ```json
 {
-  "status": { "enabled": true }
+  "maxActiveSubagents": 3,
+  "statusEnabled": true,
+  "stalledAfterMs": 60000
 }
 ```
+
+`maxActiveSubagents` and `stalledAfterMs` must be positive safe integers. `statusEnabled` must be a boolean. `stalledAfterMs` controls when missing or invalid activity snapshots become stalled; disabling status suppresses status transition registration.
 
 ## Requirements
 

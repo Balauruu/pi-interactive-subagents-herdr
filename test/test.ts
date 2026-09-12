@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -33,21 +33,24 @@ import {
 import {
   shellEscape,
   __pollForExitTest__,
-  __surfaceLayoutTest__,
 } from "../pi-extension/subagents/herdr.ts";
 import {
-  advanceStatusState,
+  advanceStatusState as advanceStatusStateWithPolicy,
   capStatusLines,
-  classifyStatus,
+  classifyStatus as classifyStatusWithPolicy,
   createStatusState,
   forceStatusAfterInterrupt,
   formatStatusAggregate,
   formatStatusLine,
   formatTransitionLine,
   observeStatus,
-  loadStatusConfig,
-  parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
+
+const TEST_STALLED_AFTER_MS = 60_000;
+const classifyStatus = (state: Parameters<typeof classifyStatusWithPolicy>[0], now: number) =>
+  classifyStatusWithPolicy(state, now, TEST_STALLED_AFTER_MS);
+const advanceStatusState = (state: Parameters<typeof advanceStatusStateWithPolicy>[0], now: number) =>
+  advanceStatusStateWithPolicy(state, now, TEST_STALLED_AFTER_MS);
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
@@ -60,6 +63,16 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
+
+const TEST_EXTENSION_CONFIG = Object.freeze({
+  maxActiveSubagents: 4,
+  statusEnabled: true,
+  stalledAfterMs: 30_000,
+});
+
+beforeEach(() => {
+  (subagentsModule as any).__test__.setExtensionConfigForTest(TEST_EXTENSION_CONFIG);
+});
 
 // --- Helpers ---
 
@@ -688,91 +701,6 @@ describe("session.ts", () => {
 });
 
 describe("status.ts", () => {
-  it("parses strict config objects", () => {
-    const disabled = parseStatusConfig({ status: { enabled: false } });
-
-    assert.deepEqual(disabled, {
-      enabled: false,
-      lineLimit: 4,
-    });
-  });
-
-  it("loads a valid config file", () => {
-    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
-    const config = loadStatusConfig(examplePath);
-
-    assert.deepEqual(config, {
-      enabled: true,
-      lineLimit: 4,
-    });
-  });
-
-  it("loads the shared example when local config is absent", () => {
-    withTempDir((dir) => {
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
-      );
-
-      const config = loadStatusConfig(join(dir, "config.json"), examplePath);
-
-      assert.deepEqual(config, {
-        enabled: true,
-        lineLimit: 4,
-      });
-    });
-  });
-
-  it("fails fast for invalid config shapes", () => {
-    assert.throws(
-      () => parseStatusConfig({ status: { enabled: "false" } }),
-      /status\.enabled must be a boolean/,
-    );
-    assert.throws(
-      () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
-      /status has unsupported key\(s\): defaultCadenceSeconds/,
-    );
-  });
-
-  it("reports when neither local nor shared config exists", () => {
-    withTempDir((dir) => {
-      assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), join(dir, "config.json.example")),
-        /Missing subagent status config\. Expected .*config\.json.*or.*config\.json\.example/,
-      );
-    });
-  });
-
-  it("reports invalid JSON from the shared example path", () => {
-    withTempDir((dir) => {
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(examplePath, "{\n");
-
-      assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), examplePath),
-        /Invalid JSON in subagent config .*config\.json\.example/,
-      );
-    });
-  });
-
-  it("fails on invalid local config instead of falling back to the shared example", () => {
-    withTempDir((dir) => {
-      const configPath = join(dir, "config.json");
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(configPath, "{\n");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
-      );
-
-      assert.throws(
-        () => loadStatusConfig(configPath, examplePath),
-        /Invalid JSON in subagent config .*config\.json/,
-      );
-    });
-  });
-
   it("keeps a missing snapshot as starting until the fixed watchdog threshold", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, { snapshot: "missing" }, 1_000);
@@ -1193,7 +1121,10 @@ describe("subagent discovery", () => {
   });
 
   it("worker is granted the spawning toolset restricted to scout and researcher", () => {
-    const worker = testApi.loadAgentDefaults("worker");
+    const worker = testApi.parseAgentDefinition(
+      readFileSync(fileURLToPath(new URL("../agents/worker.md", import.meta.url)), "utf8"),
+      "worker",
+    );
     assert.ok(worker, "expected bundled worker to be discoverable");
     assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
 
@@ -1217,25 +1148,14 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
     await withIsolatedAgentEnv(async ({ globalDir }) => {
       const webAccessDir = join(globalDir, "npm", "node_modules", "pi-web-access");
-      const askUserQuestionDir = join(
-        globalDir,
-        "npm",
-        "node_modules",
-        "@juicesharp",
-        "rpiv-ask-user-question",
-      );
       mkdirSync(webAccessDir, { recursive: true });
-      mkdirSync(askUserQuestionDir, { recursive: true });
       const webAccessPath = join(webAccessDir, "index.ts");
-      const askUserQuestionPath = join(askUserQuestionDir, "index.ts");
       writeFileSync(webAccessPath, "");
-      writeFileSync(askUserQuestionPath, "");
 
       assert.equal(testApi.getToolExtensionPath("read"), undefined);
       assert.equal(testApi.getToolExtensionPath("bash"), undefined);
       assert.equal(testApi.getToolExtensionPath("web_search"), webAccessPath);
       assert.equal(testApi.getToolExtensionPath("fetch_content"), webAccessPath);
-      assert.equal(testApi.getToolExtensionPath("ask_user_question"), askUserQuestionPath);
       assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
       // Spawning tools are registered by this extension itself.
       assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
@@ -1254,43 +1174,15 @@ describe("subagent discovery", () => {
         "pi-web-access",
       );
       const localWebAccessDir = join(localAgentDir, "npm", "node_modules", "pi-web-access");
-      const localAskUserQuestionDir = join(
-        localAgentDir,
-        "npm",
-        "node_modules",
-        "@juicesharp",
-        "rpiv-ask-user-question",
-      );
       const globalWebAccessDir = join(globalDir, "npm", "node_modules", "pi-web-access");
-      const globalAskUserQuestionDir = join(
-        globalDir,
-        "npm",
-        "node_modules",
-        "@juicesharp",
-        "rpiv-ask-user-question",
-      );
-      for (const dir of [
-        projectWebAccessDir,
-        localWebAccessDir,
-        localAskUserQuestionDir,
-        globalWebAccessDir,
-        globalAskUserQuestionDir,
-      ]) {
+      for (const dir of [projectWebAccessDir, localWebAccessDir, globalWebAccessDir]) {
         mkdirSync(dir, { recursive: true });
       }
 
       const projectWebAccessPath = join(projectWebAccessDir, "index.ts");
       const localWebAccessPath = join(localWebAccessDir, "index.ts");
-      const localAskUserQuestionPath = join(localAskUserQuestionDir, "index.ts");
       const globalWebAccessPath = join(globalWebAccessDir, "index.ts");
-      const globalAskUserQuestionPath = join(globalAskUserQuestionDir, "index.ts");
-      for (const path of [
-        projectWebAccessPath,
-        localWebAccessPath,
-        localAskUserQuestionPath,
-        globalWebAccessPath,
-        globalAskUserQuestionPath,
-      ]) {
+      for (const path of [projectWebAccessPath, localWebAccessPath, globalWebAccessPath]) {
         writeFileSync(path, "");
       }
 
@@ -1299,7 +1191,7 @@ describe("subagent discovery", () => {
         parts,
         {
           agent: "scout",
-          toolAllowlist: "fetch_content,ask_user_question",
+          toolAllowlist: "fetch_content",
           model: null,
           thinking: null,
           systemPromptMode: null,
@@ -1317,13 +1209,9 @@ describe("subagent discovery", () => {
       for (let i = 0; i < parts.length; i++) {
         if (parts[i] === "-e") extensionPaths.push(parts[i + 1]);
       }
-      assert.deepEqual(extensionPaths, [
-        shellEscape(projectWebAccessPath),
-        shellEscape(localAskUserQuestionPath),
-      ]);
+      assert.deepEqual(extensionPaths, [shellEscape(projectWebAccessPath)]);
       assert.ok(!extensionPaths.includes(shellEscape(localWebAccessPath)));
       assert.ok(!extensionPaths.includes(shellEscape(globalWebAccessPath)));
-      assert.ok(!extensionPaths.includes(shellEscape(globalAskUserQuestionPath)));
     });
   });
 
@@ -1428,61 +1316,11 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
+  it("buildSubagentToolAllowlist preserves requested tools and adds ask_question", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,ask_question,ask_user_question",
+      "read,bash,web_search,ask_question",
     );
-  });
-
-  it("grants ask_user_question to custom restricted agents and loads its extension", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir, globalDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "custom-read-agent",
-        ["name: custom-read-agent", "tools: read"].join("\n"),
-      );
-      const packageDir = join(
-        globalDir,
-        "npm",
-        "node_modules",
-        "@juicesharp",
-        "rpiv-ask-user-question",
-      );
-      mkdirSync(packageDir, { recursive: true });
-      const packagePath = join(packageDir, "index.ts");
-      writeFileSync(packagePath, "");
-
-      const defs = testApi.loadAgentDefaults("custom-read-agent");
-      assert.ok(defs, "expected custom agent to be discoverable");
-      const allowlist = testApi.buildSubagentToolAllowlist(defs.tools);
-      assert.equal(allowlist, "read,ask_question,ask_user_question");
-
-      const parts: string[] = [];
-      testApi.applySandboxToParts(
-        parts,
-        {
-          agent: "custom-read-agent",
-          toolAllowlist: allowlist,
-          model: null,
-          thinking: null,
-          systemPromptMode: null,
-          identity: null,
-          spawnable: null,
-          autoExit: true,
-          cwd: null,
-          agentDir: globalDir,
-          globalAgentDir: globalDir,
-        },
-        { artifactDir: projectDir, name: "custom-read-agent", projectCwd: projectDir },
-      );
-
-      const extensionPaths: string[] = [];
-      for (let i = 0; i < parts.length; i++) {
-        if (parts[i] === "-e") extensionPaths.push(parts[i + 1]);
-      }
-      assert.deepEqual(extensionPaths, [shellEscape(packagePath)]);
-    });
   });
 
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
@@ -2701,6 +2539,7 @@ describe("subagents widget rendering", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
+    testApi.setExtensionConfigForTest(TEST_EXTENSION_CONFIG);
 
     const originalNow = Date.now;
     Date.now = () => 1_000_000;
@@ -2733,7 +2572,7 @@ describe("subagents widget rendering", () => {
           sessionFile: "sess3",
           statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
         },
-      ], 16);
+      ], 16, TEST_EXTENSION_CONFIG);
 
       assert.deepEqual(
         lines.map((line: string) => visibleWidth(line)),
@@ -2757,6 +2596,7 @@ describe("subagents widget rendering", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
+    testApi.setExtensionConfigForTest(TEST_EXTENSION_CONFIG);
 
     const widths = [0, 1, 2];
     for (const width of widths) {
@@ -2771,7 +2611,7 @@ describe("subagents widget rendering", () => {
           sessionFile: "sess1",
           statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
         },
-      ], width);
+      ], width, TEST_EXTENSION_CONFIG);
 
       for (const line of lines) {
         assert.ok(
@@ -2858,36 +2698,6 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("herdr.ts", () => {
-  describe("surface placement", () => {
-    it("uses three agent columns, then fills the shortest columns vertically", () => {
-      const { chooseSurfacePlacement, maxHorizontalAgentColumns } = __surfaceLayoutTest__;
-      const columns: string[][] = [];
-
-      for (let index = 0; index < maxHorizontalAgentColumns; index++) {
-        assert.deepEqual(chooseSurfacePlacement("main", columns), {
-          direction: "right",
-          source: "main",
-          columnIndex: index,
-        });
-        columns.push([`agent-${index + 1}`]);
-      }
-
-      assert.deepEqual(chooseSurfacePlacement("main", columns), {
-        direction: "down",
-        source: "agent-1",
-        columnIndex: 0,
-      });
-      columns[0]!.push(`agent-${maxHorizontalAgentColumns + 1}`);
-
-      assert.deepEqual(chooseSurfacePlacement("main", columns), {
-        direction: "down",
-        source: "agent-2",
-        columnIndex: 1,
-      });
-    });
-  });
-
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
@@ -2910,4 +2720,3 @@ describe("herdr.ts", () => {
       assert.ok(escaped.includes("$world"));
     });
   });
-});

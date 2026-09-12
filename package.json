@@ -13,12 +13,17 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test": "node --test test/test.ts test/*.test.ts",
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
+    "test:layout:integration": "node --test --test-concurrency=1 test/integration/pane-layout.test.ts",
+    "test:provider:integration": "node --test --test-concurrency=1 --test-name-pattern=\"spawns a subagent that writes a file and verifies the session\" test/integration/subagent-lifecycle.test.ts",
+    "test:deployed:integration": "node --test --test-concurrency=1 test/integration/deployed-runtime.test.ts",
+    "test:deploy": "node --test test/deploy-active-package.test.ts",
+    "deploy:active-package": "node scripts/deploy-active-package.ts"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "@sinclair/typebox": "*"
   },
   "pi": {
@@ -27,8 +32,8 @@
     ]
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.65.0",
-    "@mariozechner/pi-tui": "^0.65.0",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
     "@sinclair/typebox": "^0.34.49"
   }
 }

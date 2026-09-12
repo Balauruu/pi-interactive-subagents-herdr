@@ -1,20 +1,16 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
- * Each test creates a Herdr pane, runs pi with a task that uses the subagent
- * tool, and verifies the outcome via marker files and screen output.
+ * These tests spawn REAL Pi sessions using the invoking installation's
+ * configured model resolution and credentials. Each test creates an isolated
+ * Herdr pane, runs Pi with a task that uses the subagent tool, and verifies the
+ * outcome via marker files and screen output.
  *
- * Costs: ~$0.01-0.05 per test run (haiku).
- * Duration: ~30-90s per test.
+ * Duration: ~30-90s per test. Override the bounded per-test timeout with
+ * PI_TEST_TIMEOUT (default: 180000).
  *
  * Run inside Herdr:
- *   herdr
- *   npm run test:integration
- *
- * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
- *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
+ *   npm run test:provider:integration
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -36,10 +32,10 @@ import {
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
+const providerSmokeName = "spawns a subagent that writes a file and verifies the session";
 
 if (backends.length === 0) {
-  console.log("⚠️  Herdr is not available - skipping subagent lifecycle integration tests");
-  console.log("   Run inside Herdr to enable these tests.");
+  it(providerSmokeName, () => assert.fail("Herdr infrastructure is unavailable."));
 }
 
 for (const backend of backends) {
@@ -50,18 +46,18 @@ for (const backend of backends) {
       env = createTestEnv();
     });
 
-    after(() => {
-      cleanupTestEnv(env);
+    after(async () => {
+      await cleanupTestEnv(env);
     });
 
     // ── Basic spawn + completion ──
 
-    it("spawns a subagent that writes a file and verifies the session", async () => {
+    it(providerSmokeName, async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `echo-${id}`);
+      const surface = await createTrackedSurface(env, `echo-${id}`);
       await sleep(1000);
 
       const task = [
@@ -113,7 +109,7 @@ for (const backend of backends) {
       trackTempFile(env, startFile);
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `status-${id}`);
+      const surface = await createTrackedSurface(env, `status-${id}`);
       await sleep(1000);
 
       const task = [
@@ -158,7 +154,7 @@ for (const backend of backends) {
       trackTempFile(env, fileA);
       trackTempFile(env, fileB);
 
-      const surface = createTrackedSurface(env, `parallel-${id}`);
+      const surface = await createTrackedSurface(env, `parallel-${id}`);
       await sleep(1000);
 
       const task = [
@@ -196,7 +192,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-fork-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `fork-${id}`);
+      const surface = await createTrackedSurface(env, `fork-${id}`);
       await sleep(1000);
 
       const task = [
@@ -244,7 +240,7 @@ for (const backend of backends) {
     it("subagent caller_ping sends notification back to the parent", async () => {
       const id = uniqueId();
 
-      const surface = createTrackedSurface(env, `ping-${id}`);
+      const surface = await createTrackedSurface(env, `ping-${id}`);
       await sleep(1000);
 
       const task = [
@@ -278,7 +274,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `discovery-${id}`);
+      const surface = await createTrackedSurface(env, `discovery-${id}`);
       await sleep(1000);
 
       // Use subagents_list to verify test agents are discoverable,
@@ -306,7 +302,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `sysprompt-${id}`);
+      const surface = await createTrackedSurface(env, `sysprompt-${id}`);
       await sleep(1000);
 
       const task = [

@@ -17,7 +17,12 @@ import {
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
   unlinkSync,
+  closeSync,
+  openSync,
+  readSync,
+  statSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +38,8 @@ import {
   closeSurface,
   shellEscape,
 } from "../../pi-extension/subagents/herdr.ts";
+import { parseHerdrPaneLayout, type HerdrPaneLayout } from "../../pi-extension/subagents/pane-layout.ts";
+import { verifyDeployment } from "../../scripts/deploy-active-package.ts";
 
 // Re-export Herdr surface primitives for tests
 export {
@@ -67,22 +74,19 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 
 // ── Configuration ──
 
-/** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
-
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
-export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
+export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "180000");
 
 // ── Backend detection ──
 
-/** Detect whether Herdr is available in the current environment. */
+/** Detect whether the invoking Pi session has an available Herdr backend. */
 export function getAvailableBackends(): string[] {
   return isMuxAvailable() ? ["herdr"] : [];
 }
 
 export function getFocusedSurface(): string | null {
   try {
-    const response = JSON.parse(execFileSync("herdr", ["pane", "current"], { encoding: "utf8" }));
+    const response = JSON.parse(execFileSync("herdr", ["pane", "current", "--current"], { encoding: "utf8" }));
     return response.result?.pane?.pane_id ?? null;
   } catch {
     return null;
@@ -94,6 +98,8 @@ export function getFocusedSurface(): string | null {
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
+  /** Dedicated Pi session store; never shares the planning session. */
+  sessionDir: string;
   /** Panes created during the test (cleaned up automatically) */
   surfaces: string[];
   /** Temp files to clean up */
@@ -109,25 +115,27 @@ export function createTestEnv(): TestEnv {
   const agentsDir = join(dir, ".pi", "agents");
   mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into the project-local agents dir
+  // Copy model-agnostic test agents. Parent and child Pi processes resolve the
+  // current configured model and credentials through the normal Pi paths.
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
-      if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
-      }
+      if (!file.endsWith(".md")) continue;
+      cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
     }
   }
 
-  return { dir, surfaces: [], tempFiles: [] };
+  const sessionDir = join(dir, ".pi-test-sessions");
+  mkdirSync(sessionDir, { recursive: true });
+  return { dir, sessionDir, surfaces: [], tempFiles: [] };
 }
 
 /**
  * Clean up all resources created during the test.
  */
-export function cleanupTestEnv(env: TestEnv): void {
+export async function cleanupTestEnv(env: TestEnv): Promise<void> {
   for (const surface of env.surfaces) {
     try {
-      closeSurface(surface);
+      await closeSurface(surface);
     } catch {}
   }
   for (const file of env.tempFiles) {
@@ -143,19 +151,19 @@ export function cleanupTestEnv(env: TestEnv): void {
 /**
  * Create a surface and register it for automatic cleanup.
  */
-export function createTrackedSurface(env: TestEnv, name: string): string {
-  const surface = createSurface(name);
+export async function createTrackedSurface(env: TestEnv, name: string): Promise<string> {
+  const surface = await createSurface(name);
   env.surfaces.push(surface);
   return surface;
 }
 
-export function createTrackedSurfaceSplit(
+export async function createTrackedSurfaceSplit(
   env: TestEnv,
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
-): string {
-  const surface = createSurfaceSplit(name, direction, fromSurface);
+): Promise<string> {
+  const surface = await createSurfaceSplit(name, direction, fromSurface);
   env.surfaces.push(surface);
   return surface;
 }
@@ -165,6 +173,72 @@ export function createTrackedSurfaceSplit(
  */
 export function untrackSurface(env: TestEnv, surface: string): void {
   env.surfaces = env.surfaces.filter((s) => s !== surface);
+}
+
+// ── Pane-only layout workspace ──
+
+const HERDR_COMMAND_TIMEOUT = 5_000;
+
+export interface PaneLayoutWorkspace {
+  workspaceId: string;
+  rootPaneId: string;
+  dir: string;
+}
+
+function herdrJson(args: string[]): unknown {
+  let stdout: string;
+  try {
+    stdout = execFileSync("herdr", args, { encoding: "utf8", timeout: HERDR_COMMAND_TIMEOUT });
+  } catch {
+    throw new Error(`Herdr ${args.slice(0, 2).join(" ")} command failed`);
+  }
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new Error(`Herdr ${args.slice(0, 2).join(" ")} returned invalid JSON`);
+  }
+}
+
+function requiredId(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`Herdr ${label} was missing`);
+  return value;
+}
+
+/** Create a no-focus Herdr workspace rooted in a unique temporary directory. */
+export function createPaneLayoutWorkspace(label: string): PaneLayoutWorkspace {
+  const dir = mkdtempSync(join(tmpdir(), "pi-herdr-layout-"));
+  try {
+    const response = herdrJson(["workspace", "create", "--cwd", dir, "--label", label, "--no-focus"]);
+    const result = (response as { result?: { workspace?: { workspace_id?: unknown }; root_pane?: { pane_id?: unknown } } }).result;
+    return {
+      workspaceId: requiredId(result?.workspace?.workspace_id, "workspace id"),
+      rootPaneId: requiredId(result?.root_pane?.pane_id, "root pane id"),
+      dir,
+    };
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/** Parse only validated rectangle data; raw Herdr command output is not retained. */
+export function readPaneLayout(rootPaneId: string): HerdrPaneLayout {
+  const parsed = parseHerdrPaneLayout(herdrJson(["pane", "layout", "--pane", rootPaneId]));
+  if (!parsed.ok) throw new Error(`Herdr returned ${parsed.reason} layout data`);
+  return parsed.layout;
+}
+
+/** Always remove the workspace and its temporary directory, even after a failed assertion. */
+export function cleanupPaneLayoutWorkspace(workspace: PaneLayoutWorkspace): void {
+  try {
+    herdrJson(["workspace", "close", workspace.workspaceId]);
+  } finally {
+    rmSync(workspace.dir, { recursive: true, force: true });
+  }
+}
+
+export function paneExists(rootPaneId: string, paneId: string): boolean {
+  return readPaneLayout(rootPaneId).panes.some((pane) => pane.paneId === paneId);
 }
 
 // ── Pi session management ──
@@ -180,9 +254,8 @@ export function startPi(
   surface: string,
   testDir: string,
   task: string,
-  opts?: { model?: string; extraArgs?: string },
+  opts?: { extraArgs?: string },
 ): void {
-  const model = opts?.model ?? TEST_MODEL;
   const extra = opts?.extraArgs ?? "";
 
   // Force pi to load the working-tree extension (not an installed pi-package
@@ -194,7 +267,6 @@ export function startPi(
     `pi`,
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
-    `--model ${shellEscape(model)}`,
     extra,
     shellEscape(task),
   ]
@@ -204,6 +276,73 @@ export function startPi(
   sendLongCommand(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
     scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
   });
+}
+
+export interface DeployedRuntimeIdentityOptions {
+  agentDir: string;
+  repo: string;
+  rollback: string;
+}
+
+/** Prove normal package discovery resolves the same approved candidate as the active settings pin. */
+export function verifyDeployedRuntimeIdentity(options: DeployedRuntimeIdentityOptions) {
+  return verifyDeployment({
+    settings: join(resolve(options.agentDir), "settings.json"),
+    repo: resolve(options.repo),
+    rollback: resolve(options.rollback),
+  });
+}
+
+export interface DeployedPiCommandOptions {
+  agentDir: string;
+  sessionDir: string;
+  testDir: string;
+  task: string;
+}
+
+/** Build a normal auto-discovery command with no source or extension overrides. */
+export function buildDeployedPiCommand(options: DeployedPiCommandOptions): string {
+  for (const [label, value] of Object.entries({
+    agentDir: options.agentDir,
+    sessionDir: options.sessionDir,
+    testDir: options.testDir,
+  })) {
+    if (!value || value.trim() === "") throw new Error(`Deployed Pi ${label} is required.`);
+  }
+  return [
+    `cd ${shellEscape(resolve(options.testDir))} &&`,
+    `PI_CODING_AGENT_DIR=${shellEscape(resolve(options.agentDir))}`,
+    `PI_CODING_AGENT_SESSION_DIR=${shellEscape(resolve(options.sessionDir))}`,
+    "pi",
+    shellEscape(options.task),
+  ].join(" ");
+}
+
+/** Start a distinct Pi process through the active package ownership path. */
+export function startDeployedPi(surface: string, options: DeployedPiCommandOptions): void {
+  mkdirSync(options.sessionDir, { recursive: true });
+  const command = buildDeployedPiCommand(options);
+  sendLongCommand(surface, `${command}; echo '__TEST_DONE_'$?'__'`, {
+    scriptPath: join(options.testDir, `test-deployed-launch-${Date.now()}.sh`),
+  });
+}
+
+/** Submit a distinct user turn or slash command to an idle Pi pane. */
+export function sendPiInput(surface: string, input: string): void {
+  if (!input.trim()) throw new Error("Pi input is required.");
+  sendCommand(surface, input);
+}
+
+/** Queue a follow-up user turn through Pi's documented Alt+Enter binding. */
+export function queuePiInput(surface: string, input: string): void {
+  if (!input.trim()) throw new Error("Pi input is required.");
+  execFileSync("herdr", ["pane", "send-text", surface, input], { encoding: "utf8" });
+  execFileSync("herdr", ["pane", "send-keys", surface, "alt+enter"], { encoding: "utf8" });
+}
+
+/** Exit Pi through its documented clear-then-exit Ctrl+C binding. */
+export function exitPi(surface: string): void {
+  execFileSync("herdr", ["pane", "send-keys", surface, "ctrl+c", "ctrl+c"], { encoding: "utf8" });
 }
 
 // ── Polling helpers ──
@@ -224,7 +363,7 @@ export async function waitForScreen(
       const screen = await readScreenAsync(surface, lines);
       if (pattern.test(screen)) return screen;
     } catch {}
-    await sleep(2000);
+    await sleep(Math.min(2000, Math.max(0, timeout - (Date.now() - start))));
   }
 
   let finalScreen = "";
@@ -247,16 +386,74 @@ export async function waitForFile(
 ): Promise<string> {
   const start = Date.now();
   while (Date.now() - start < timeout) {
-    if (existsSync(path)) {
-      const content = readFileSync(path, "utf8");
-      if (!contentPattern || contentPattern.test(content)) return content;
-    }
-    await sleep(2000);
+    try {
+      if (existsSync(path)) {
+        const content = readFileSync(path, "utf8");
+        if (!contentPattern || contentPattern.test(content)) return content;
+      }
+    } catch {}
+    await sleep(Math.min(2000, Math.max(0, timeout - (Date.now() - start))));
   }
   throw new Error(
     `Timeout (${timeout}ms) waiting for file: ${path}` +
       (contentPattern ? ` matching ${contentPattern}` : ""),
   );
+}
+
+const SESSION_SCAN_BYTE_LIMIT = 1024 * 1024;
+const SESSION_SCAN_FILE_LIMIT = 16;
+
+function readSessionTail(path: string, remaining: number): string {
+  const size = statSync(path).size;
+  const bytesToRead = Math.min(size, remaining);
+  if (bytesToRead === 0) return "";
+  const descriptor = openSync(path, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    const bytesRead = readSync(descriptor, buffer, 0, bytesToRead, size - bytesToRead);
+    return buffer.toString("utf8", 0, bytesRead);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+/** Wait for a successful extension-delivered subagent result in the isolated Pi session store. */
+export async function waitForDeliveredSubagent(
+  sessionDir: string,
+  name: string,
+  timeout: number = PI_TIMEOUT,
+): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    try {
+      const paths = readdirSync(sessionDir, { encoding: "utf8", recursive: true })
+        .filter((path) => path.endsWith(".jsonl"))
+        .sort()
+        .reverse()
+        .slice(0, SESSION_SCAN_FILE_LIMIT);
+      for (const relativePath of paths) {
+        const content = readSessionTail(join(sessionDir, relativePath), SESSION_SCAN_BYTE_LIMIT);
+        for (const line of content.split("\n")) {
+          try {
+            const entry = JSON.parse(line) as {
+              type?: string;
+              customType?: string;
+              details?: { name?: string; exitCode?: number };
+            };
+            if (entry.type !== "custom_message" || entry.customType !== "subagent_result" || entry.details?.name !== name) continue;
+            if (entry.details.exitCode !== 0) throw new Error(`Subagent ${name} delivered exit code ${entry.details.exitCode}`);
+            return;
+          } catch (error) {
+            if (error instanceof Error && error.message.startsWith(`Subagent ${name} delivered`)) throw error;
+          }
+        }
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith(`Subagent ${name} delivered`)) throw error;
+    }
+    await sleep(Math.min(2000, Math.max(0, timeout - (Date.now() - started))));
+  }
+  throw new Error(`Timeout (${timeout}ms) waiting for delivered subagent result: ${name}`);
 }
 
 /**

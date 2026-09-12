@@ -1,5 +1,5 @@
 {
-  "status": {
-    "enabled": true
-  }
+  "maxActiveSubagents": 3,
+  "statusEnabled": true,
+  "stalledAfterMs": 60000
 }

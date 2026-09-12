@@ -2,14 +2,12 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
-export const DEFAULT_STATUS_LINE_LIMIT = 4;
+const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
+const DEFAULT_EXTENSION_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 
 export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
 export type SubagentStatusSource = "pi" | "claude";
@@ -17,9 +15,10 @@ export type SubagentStatusTransition = "stalled" | "recovered" | null;
 export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
 export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 
-export interface StatusConfig {
-  enabled: boolean;
-  lineLimit: number;
+export interface ExtensionConfig {
+  readonly maxActiveSubagents: number;
+  readonly statusEnabled: boolean;
+  readonly stalledAfterMs: number;
 }
 
 export type StatusObservation =
@@ -83,34 +82,29 @@ export interface CappedStatusLines {
   overflow: number;
 }
 
-function invalidStatusConfig(source: string, message: string): never {
-  throw new Error(`Invalid subagent status config in ${source}: ${message}`);
+function invalidExtensionConfig(source: string, message: string): never {
+  throw new Error(`Invalid subagent extension config in ${source}: ${message}`);
 }
 
-function requireObject(value: unknown, source: string, fieldName: string): Record<string, unknown> {
-  if (value == null || typeof value !== "object" || Array.isArray(value)) {
-    invalidStatusConfig(source, `${fieldName} must be an object`);
+function requirePlainObject(value: unknown, source: string): Record<string, unknown> {
+  if (value == null || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    invalidExtensionConfig(source, "root must be a plain object");
   }
   return value as Record<string, unknown>;
 }
 
 function requireBoolean(value: unknown, source: string, fieldName: string): boolean {
   if (typeof value !== "boolean") {
-    invalidStatusConfig(source, `${fieldName} must be a boolean`);
+    invalidExtensionConfig(source, `${fieldName} must be a boolean`);
   }
   return value;
 }
 
-function rejectUnsupportedKeys(
-  value: Record<string, unknown>,
-  allowedKeys: string[],
-  source: string,
-  fieldName: string,
-): void {
-  const unsupportedKeys = Object.keys(value).filter((key) => !allowedKeys.includes(key));
-  if (unsupportedKeys.length > 0) {
-    invalidStatusConfig(source, `${fieldName} has unsupported key(s): ${unsupportedKeys.join(", ")}`);
+function requirePositiveSafeInteger(value: unknown, source: string, fieldName: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    invalidExtensionConfig(source, `${fieldName} must be a positive safe integer`);
   }
+  return value;
 }
 
 function truncateText(text: string, maxLength: number): string {
@@ -137,54 +131,47 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
   return snapshot.activityLabel ?? snapshot.activeScope;
 }
 
-export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
-  const config = requireObject(rawConfig, source, "root");
-  const status = requireObject(config.status, source, "status");
-  rejectUnsupportedKeys(status, ["enabled"], source, "status");
-  const enabled = requireBoolean(status.enabled, source, "status.enabled");
+const EXTENSION_CONFIG_KEYS = ["maxActiveSubagents", "statusEnabled", "stalledAfterMs"] as const;
 
-  return {
-    enabled,
-    lineLimit: DEFAULT_STATUS_LINE_LIMIT,
-  };
-}
-
-function readStatusConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
-  try {
-    return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
-  } catch (error) {
-    const errno = error as NodeJS.ErrnoException;
-    if (errno.code !== "ENOENT") throw error;
+export function parseExtensionConfig(rawConfig: unknown, source = "config.json"): ExtensionConfig {
+  const config = requirePlainObject(rawConfig, source);
+  const keys = Object.keys(config);
+  const unknownKeys = keys.filter((key) => !EXTENSION_CONFIG_KEYS.includes(key as typeof EXTENSION_CONFIG_KEYS[number]));
+  if (unknownKeys.length > 0) {
+    invalidExtensionConfig(source, `unknown key(s): ${unknownKeys.join(", ")}`);
   }
 
-  try {
-    return { sourcePath: examplePath, rawConfig: readFileSync(examplePath, "utf8") };
-  } catch (error) {
-    const errno = error as NodeJS.ErrnoException;
-    if (errno.code === "ENOENT") {
-      throw new Error(
-        `Missing subagent status config. Expected ${configPath} or ${examplePath}.`,
-      );
+  for (const key of EXTENSION_CONFIG_KEYS) {
+    if (!Object.hasOwn(config, key)) {
+      invalidExtensionConfig(source, `${key} is required`);
     }
-    throw error;
   }
+
+  return Object.freeze({
+    maxActiveSubagents: requirePositiveSafeInteger(config.maxActiveSubagents, source, "maxActiveSubagents"),
+    statusEnabled: requireBoolean(config.statusEnabled, source, "statusEnabled"),
+    stalledAfterMs: requirePositiveSafeInteger(config.stalledAfterMs, source, "stalledAfterMs"),
+  });
 }
 
-export function loadStatusConfig(
-  configPath = DEFAULT_STATUS_CONFIG_PATH,
-  examplePath = STATUS_CONFIG_EXAMPLE_PATH,
-): StatusConfig {
-  const { sourcePath, rawConfig } = readStatusConfigFile(configPath, examplePath);
+export function loadExtensionConfig(configPath = DEFAULT_EXTENSION_CONFIG_PATH): ExtensionConfig {
+  let rawConfig: string;
+  try {
+    rawConfig = readFileSync(configPath, "utf8");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to read subagent extension config ${configPath}: ${detail}`);
+  }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawConfig) as unknown;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid JSON in subagent config ${sourcePath}: ${detail}`);
+    throw new Error(`Invalid JSON in subagent extension config ${configPath}: ${detail}`);
   }
 
-  return parseStatusConfig(parsed, sourcePath);
+  return parseExtensionConfig(parsed, configPath);
 }
 
 export function formatElapsedDuration(ms: number): string {
@@ -310,21 +297,25 @@ export function forceStatusAfterInterrupt(state: SubagentStatusState, now: numbe
   };
 }
 
-function classifyProblemState(state: SubagentStatusState, now: number): Pick<StatusSnapshot, "kind" | "statusLabel"> {
+function classifyProblemState(
+  state: SubagentStatusState,
+  now: number,
+  stalledAfterMs: number,
+): Pick<StatusSnapshot, "kind" | "statusLabel"> {
   const problemLabel = snapshotProblemLabel(state.snapshotState);
   const hasValidSnapshot = state.lastActivityAtMs != null;
 
   if (!hasValidSnapshot) {
     const referenceMs = state.firstObservationAtMs ?? state.startTimeMs;
     const elapsedMs = Math.max(0, now - referenceMs);
-    return elapsedMs >= SNAPSHOT_STALLED_AFTER_MS
+    return elapsedMs >= stalledAfterMs
       ? { kind: "stalled", statusLabel: problemLabel }
       : { kind: "starting", statusLabel: null };
   }
 
   const problemSinceMs = state.snapshotProblemSinceMs ?? now;
   const problemMs = Math.max(0, now - problemSinceMs);
-  if (problemMs >= SNAPSHOT_STALLED_AFTER_MS) return { kind: "stalled", statusLabel: problemLabel };
+  if (problemMs >= stalledAfterMs) return { kind: "stalled", statusLabel: problemLabel };
 
   const lastHealthyKind = state.activeNow
     ? "active"
@@ -336,7 +327,11 @@ function classifyProblemState(state: SubagentStatusState, now: number): Pick<Sta
   return { kind: lastHealthyKind, statusLabel: problemLabel };
 }
 
-export function classifyStatus(state: SubagentStatusState, now: number): StatusSnapshot {
+export function classifyStatus(
+  state: SubagentStatusState,
+  now: number,
+  stalledAfterMs: number,
+): StatusSnapshot {
   const elapsedMs = Math.max(0, now - state.startTimeMs);
   const elapsedText = formatElapsedDuration(elapsedMs);
 
@@ -373,11 +368,11 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
     } else {
       const referenceMs = state.firstObservationAtMs ?? state.startTimeMs;
       const elapsedSinceObservationMs = Math.max(0, now - referenceMs);
-      kind = elapsedSinceObservationMs >= SNAPSHOT_STALLED_AFTER_MS ? "stalled" : "starting";
+      kind = elapsedSinceObservationMs >= stalledAfterMs ? "stalled" : "starting";
       statusLabel = null;
     }
   } else {
-    const classified = classifyProblemState(state, now);
+    const classified = classifyProblemState(state, now, stalledAfterMs);
     kind = classified.kind;
     statusLabel = classified.statusLabel;
   }
@@ -413,12 +408,13 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
 export function advanceStatusState(
   state: SubagentStatusState,
   now: number,
+  stalledAfterMs: number,
 ): {
   nextState: SubagentStatusState;
   snapshot: StatusSnapshot;
   transition: SubagentStatusTransition;
 } {
-  const snapshot = classifyStatus(state, now);
+  const snapshot = classifyStatus(state, now, stalledAfterMs);
   const transition =
     state.currentKind !== "stalled" && snapshot.kind === "stalled"
       ? "stalled"
