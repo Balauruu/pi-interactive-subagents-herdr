@@ -1286,6 +1286,8 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  launchSubagent,
+  settleFailedLaunch,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1304,6 +1306,52 @@ function startWidgetRefresh() {
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
 }
 
+interface LaunchFailureState {
+  id: string;
+  lifecycle: LifecycleRun;
+  surface: string | null;
+}
+
+type TrackLaunchAttempt = (attempt: LaunchFailureState) => void;
+type CloseLaunchSurface = (surface: string) => Promise<unknown>;
+
+async function settleFailedLaunch(
+  id: string,
+  lifecycle: LifecycleRun,
+  surface: string | null,
+  error: unknown,
+  closeOwnedSurface: CloseLaunchSurface = closeSurface,
+): Promise<void> {
+  lifecycleRuns.delete(id);
+  runningSubagents.delete(id);
+  await abandonLifecycleRun(lifecycle, error, {
+    cleanup: surface
+      ? async () => {
+          await closeOwnedSurface(surface);
+        }
+      : undefined,
+  });
+}
+
+function withLaunchFailureSettlement<TResult>(
+  operation: (trackAttempt: TrackLaunchAttempt, ...args: any[]) => Promise<TResult>,
+): (...args: any[]) => Promise<TResult> {
+  return async (...args: any[]): Promise<TResult> => {
+    const state: { attempt: LaunchFailureState | null } = { attempt: null };
+    try {
+      return await operation((attempt) => {
+        state.attempt = attempt;
+      }, ...args);
+    } catch (error) {
+      const attempt = state.attempt;
+      if (attempt) {
+        await settleFailedLaunch(attempt.id, attempt.lifecycle, attempt.surface, error);
+      }
+      throw error;
+    }
+  };
+}
+
 /**
  * Launch a subagent: creates the Herdr pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
@@ -1314,6 +1362,17 @@ async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
   options?: { surface?: string },
+): Promise<RunningSubagent> {
+  return withLaunchFailureSettlement((trackAttempt) =>
+    launchSubagentUnchecked(params, ctx, options, trackAttempt)
+  )();
+}
+
+async function launchSubagentUnchecked(
+  params: typeof SubagentParams.static,
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  options: { surface?: string } | undefined,
+  trackAttempt: TrackLaunchAttempt,
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1337,6 +1396,8 @@ async function launchSubagent(
     ownerId: `owner-${id}`,
     maxActiveSubagents: extensionConfig!.maxActiveSubagents,
   });
+  const launchAttempt: LaunchFailureState = { id, lifecycle, surface: null };
+  trackAttempt(launchAttempt);
   lifecycleRuns.set(id, lifecycle);
   markLifecycleRunning(lifecycle);
 
@@ -1360,14 +1421,8 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  let surface: string;
-  try {
-    surface = options?.surface ?? await createSurface(params.name);
-  } catch (error) {
-    lifecycleRuns.delete(id);
-    await abandonLifecycleRun(lifecycle, error);
-    throw error;
-  }
+  const surface = options?.surface ?? await createSurface(params.name);
+  launchAttempt.surface = surface;
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -2286,7 +2341,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      execute: withLaunchFailureSettlement(async (
+        trackAttempt,
+        _toolCallId,
+        params,
+        _signal,
+        _onUpdate,
+        ctx,
+      ) => {
         const requestedName = params.name?.trim();
         if (!requestedName) {
           const err = "Provide the subagent's `name` to steer (if running) or resume (if finished).";
@@ -2373,16 +2435,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ownerId: `owner-${id}`,
           maxActiveSubagents: extensionConfig!.maxActiveSubagents,
         });
+        const launchAttempt: LaunchFailureState = { id, lifecycle, surface: null };
+        trackAttempt(launchAttempt);
         lifecycleRuns.set(id, lifecycle);
         markLifecycleRunning(lifecycle);
-        let surface: string;
-        try {
-          surface = await createSurface(name);
-        } catch (error) {
-          lifecycleRuns.delete(id);
-          await abandonLifecycleRun(lifecycle, error);
-          throw error;
-        }
+        const surface = await createSurface(name);
+        launchAttempt.surface = surface;
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
@@ -2549,7 +2607,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             status: "started",
           },
         };
-      },
+      }),
     });
 
   // /subagent command — spawn a subagent by name

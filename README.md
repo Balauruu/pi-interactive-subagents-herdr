@@ -40,21 +40,21 @@ A reconciliation returns only a structured, redacted outcome: root ID, owned-pan
 
 The real-CLI suite creates a unique no-focus Herdr workspace rooted in a temporary directory, performs split, layout, bounded resize, and owned close operations, then closes the workspace and removes that directory in `finally` cleanup. It verifies that the caller pane remains unchanged and accepts a minimum pane-area ratio of `0.60` as reasonably symmetric after representative spawn and cleanup sequences. This permits Herdr's single bounded fractional correction while rejecting an unchanged 1:2 split.
 
-All live integration entrypoints use the same fail-closed preflight before detecting Herdr or allocating resources. They require `PI_LIVE_TESTS=1`, a non-empty syntactically valid `PI_TEST_MODEL` in `provider/model` form, and the active Herdr caller context. The guard skips only when no opt-in is supplied. An invalid opt-in, model, caller context, or unavailable Herdr infrastructure fails non-zero and names only the missing or invalid variable, never its value. There is no default test model.
+Live integration entrypoints use the invoking Pi installation's configured model resolution, credentials, and available Herdr capabilities. Run them only from a Herdr-managed Pi session. Each suite uses isolated temporary sessions and workspaces, bounded timeouts, and `finally` cleanup. Missing Herdr infrastructure fails before test resources are allocated.
 
-Run the real workspace suite only from a Herdr-managed pane:
-
-```bash
-PI_LIVE_TESTS=1 PI_TEST_MODEL='provider/model' npm run test:layout:integration
-```
-
-Run one bounded provider-backed smoke test with the same explicit authorization:
+Run the real workspace suite:
 
 ```bash
-PI_LIVE_TESTS=1 PI_TEST_MODEL='provider/model' npm run test:provider:integration
+npm run test:layout:integration
 ```
 
-The provider command runs only the basic spawn-and-completion case with the suite's existing bounded timeout and `finally` cleanup. `npm test` remains the offline verification for the planner and failure/cancellation paths. S05 owns broader diagnostics, offline regressions, and guarded authorized live tests. S06 owns verification of the active deployed artifact and the complete real child/pane lifecycle.
+Run one bounded provider-backed smoke test:
+
+```bash
+npm run test:provider:integration
+```
+
+The provider command runs only the basic spawn-and-completion case. `npm test` remains the offline verification for the planner and failure/cancellation paths. `npm run test:deployed:integration` proves normal package discovery, source identity, admission, delivery, slot release, and owner-safe pane cleanup against the active deployment.
 
 ## Tools
 

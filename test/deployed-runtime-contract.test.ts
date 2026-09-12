@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -55,14 +55,14 @@ test("deployed Pi command uses normal package discovery with isolated roots", ()
     agentDir: "/active/pi-agent",
     sessionDir: "/tmp/isolated-sessions",
     testDir: "/tmp/isolated-project",
-    model: "openai-codex/gpt-5.6-sol",
     task: "call the installed subagent tool",
   });
   assert.match(command, /PI_CODING_AGENT_DIR='\/active\/pi-agent'/);
   assert.match(command, /PI_CODING_AGENT_SESSION_DIR='\/tmp\/isolated-sessions'/);
-  assert.match(command, /pi --model 'openai-codex\/gpt-5.6-sol'/);
+  assert.match(command, /pi 'call the installed subagent tool'/);
+  assert.doesNotMatch(command, /--model/);
   assert.doesNotMatch(command, /(?:^|\s)(?:-e|-ne|--extension|--no-extensions)(?:\s|$)/);
-  assert.throws(() => buildDeployedPiCommand({ agentDir: "", sessionDir: "/s", testDir: "/p", model: "m/x", task: "x" }), /agentDir is required/);
+  assert.throws(() => buildDeployedPiCommand({ agentDir: "", sessionDir: "/s", testDir: "/p", task: "x" }), /agentDir is required/);
 });
 
 test("identity verification requires matching active pin, checkout, manifest, config, and rollback candidate", () => {
@@ -147,14 +147,4 @@ test("delivered-result polling fails immediately for a matching non-zero result"
 test("deployed Pi input rejects an empty user turn before touching Herdr", () => {
   assert.throws(() => sendPiInput("pane", "  "), /Pi input is required/);
   assert.throws(() => queuePiInput("pane", "  "), /Pi input is required/);
-});
-
-test("deployed integration command rejects missing live authorization before test discovery", () => {
-  const result = spawnSync(process.execPath, ["test/live-test-entrypoint.ts"], {
-    cwd: resolve(import.meta.dirname, ".."),
-    encoding: "utf8",
-    env: { PATH: process.env.PATH ?? "" },
-  });
-  assert.notEqual(result.status, 0);
-  assert.match(`${result.stdout}${result.stderr}`, /PI_LIVE_TESTS is missing/);
 });

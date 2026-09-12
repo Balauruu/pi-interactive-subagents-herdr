@@ -167,8 +167,12 @@ export async function settleLifecycleRun(run: LifecycleRun, actions: SettlementA
   }
 }
 
-/** Pre-launch failures become cancellation evidence and still release their admission slot. */
-export async function abandonLifecycleRun(run: LifecycleRun, error: unknown): Promise<void> {
+/** Launch failures become cancellation evidence and still settle independent cleanup actions. */
+export async function abandonLifecycleRun(
+  run: LifecycleRun,
+  error: unknown,
+  actions: Pick<SettlementActions, "cleanup" | "layout"> = {},
+): Promise<void> {
   try {
     persistLifecycleTerminal(run, {
       exitCode: null,
@@ -181,6 +185,6 @@ export async function abandonLifecycleRun(run: LifecycleRun, error: unknown): Pr
   } catch {
     return;
   }
-  await settleLifecycleRun(run, {});
+  await settleLifecycleRun(run, actions);
   void error;
 }

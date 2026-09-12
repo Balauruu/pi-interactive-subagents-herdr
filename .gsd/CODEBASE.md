@@ -1,7 +1,7 @@
 # Codebase Map
 
-Generated: 2026-09-11T12:38:39Z | Files: 42 | Described: 0/42
-<!-- gsd:codebase-meta {"generatedAt":"2026-09-11T12:38:39Z","fingerprint":"a89a3fe6d55c60c9685ab3bdc6bb397f19e5fb57","fileCount":42,"truncated":false} -->
+Generated: 2026-09-12T00:05:45Z | Files: 48 | Described: 0/48
+<!-- gsd:codebase-meta {"generatedAt":"2026-09-12T00:05:45Z","fingerprint":"c07c86f5e2975f9cbe1f111225d8bf8ed6bf996a","fileCount":48,"truncated":false} -->
 
 ### (root)/
 - `.gitignore`
@@ -37,12 +37,19 @@ Generated: 2026-09-11T12:38:39Z | Files: 42 | Described: 0/42
 ### pi-extension/subagents/tools/
 - `pi-extension/subagents/tools/safe-bash.ts`
 
+### scripts/
+- `scripts/deploy-active-package.ts`
+
 ### test/
 - `test/api-alignment.test.ts`
 - `test/config.test.ts`
+- `test/deploy-active-package.test.ts`
+- `test/deployed-runtime-contract.test.ts`
 - `test/failure-visibility.test.ts`
+- `test/herdr-availability.test.ts`
 - `test/lifecycle-integration.test.ts`
 - `test/lifecycle.test.ts`
+- `test/live-test-entrypoint.ts`
 - `test/live-test-guard.test.ts`
 - `test/live-test-guard.ts`
 - `test/owned-transitions-integration.test.ts`
@@ -54,6 +61,7 @@ Generated: 2026-09-11T12:38:39Z | Files: 42 | Described: 0/42
 - `test/test.ts`
 
 ### test/integration/
+- `test/integration/deployed-runtime.test.ts`
 - `test/integration/harness.ts`
 - `test/integration/pane-layout.test.ts`
 - `test/integration/subagent-lifecycle.test.ts`

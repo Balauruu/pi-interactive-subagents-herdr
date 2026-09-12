@@ -1,24 +1,20 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with explicitly authorized LLM calls.
- * Each test creates a Herdr pane, runs pi with a task that uses the subagent
- * tool, and verifies the outcome via marker files and screen output.
+ * These tests spawn REAL Pi sessions using the invoking installation's
+ * configured model resolution and credentials. Each test creates an isolated
+ * Herdr pane, runs Pi with a task that uses the subagent tool, and verifies the
+ * outcome via marker files and screen output.
  *
- * Costs depend on the explicitly selected provider/model.
- * Duration: ~30-90s per test.
+ * Duration: ~30-90s per test. Override the bounded per-test timeout with
+ * PI_TEST_TIMEOUT (default: 120000).
  *
  * Run inside Herdr:
- *   PI_LIVE_TESTS=1 PI_TEST_MODEL='provider/model' npm run test:provider:integration
- *
- * Configuration:
- *   PI_TEST_MODEL     — required provider/model identifier for all pi sessions
- *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
+ *   npm run test:provider:integration
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { formatLiveTestPreflightFailure, preflightLiveTest } from "../live-test-guard.ts";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -35,16 +31,11 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const liveTestPreflight = preflightLiveTest(process.env);
-const backends = getAvailableBackends(liveTestPreflight);
+const backends = getAvailableBackends();
 const providerSmokeName = "spawns a subagent that writes a file and verifies the session";
 
-if (liveTestPreflight.status === "disabled") {
-  it(providerSmokeName, { skip: "PI_LIVE_TESTS is not enabled" }, () => {});
-} else if (liveTestPreflight.status === "rejected") {
-  it(providerSmokeName, () => assert.fail(formatLiveTestPreflightFailure(liveTestPreflight)));
-} else if (backends.length === 0) {
-  it(providerSmokeName, () => assert.fail("Live test guard rejected: Herdr infrastructure is unavailable."));
+if (backends.length === 0) {
+  it(providerSmokeName, () => assert.fail("Herdr infrastructure is unavailable."));
 }
 
 for (const backend of backends) {

@@ -5,7 +5,6 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { loadExtensionConfig } from "../../pi-extension/subagents/status.ts";
-import { formatLiveTestPreflightFailure, preflightLiveTest } from "../live-test-guard.ts";
 import {
   PI_TIMEOUT,
   cleanupPaneLayoutWorkspace,
@@ -32,8 +31,7 @@ const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ACTIVE_AGENT_DIR = resolve(PROJECT_ROOT, "../../../..");
 const ROLLBACK = join(ACTIVE_AGENT_DIR, "settings.json.m001-s06.rollback.json");
 const MIN_AREA_RATIO = 0.60;
-const liveTestPreflight = preflightLiveTest(process.env);
-const backends = getAvailableBackends(liveTestPreflight);
+const backends = getAvailableBackends();
 
 function assertBalanced(rootPaneId: string, expectedPaneIds?: readonly string[]): void {
   const layout = readPaneLayout(rootPaneId);
@@ -91,13 +89,9 @@ function boundedDiagnostics(rootPaneId: string, parentPaneId: string, phase: str
   return `phase=${phase}; layout=${layout}; parent-screen=${screen}`;
 }
 
-if (liveTestPreflight.status === "disabled") {
-  test("deployed runtime integration requires PI_LIVE_TESTS=1", { skip: "PI_LIVE_TESTS is not enabled" }, () => {});
-} else if (liveTestPreflight.status === "rejected") {
-  test("deployed runtime integration preflight fails closed", () => assert.fail(formatLiveTestPreflightFailure(liveTestPreflight)));
-} else if (backends.length === 0) {
+if (backends.length === 0) {
   test("deployed runtime integration requires available Herdr infrastructure", () =>
-    assert.fail("Live test guard rejected: Herdr infrastructure is unavailable."),
+    assert.fail("Herdr infrastructure is unavailable."),
   );
 } else {
   test("normal package auto-discovery enforces admission and cleans owned Herdr panes", { timeout: PI_TIMEOUT * 4 }, async () => {

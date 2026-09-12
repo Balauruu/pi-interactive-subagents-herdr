@@ -39,11 +39,6 @@ import {
   shellEscape,
 } from "../../pi-extension/subagents/herdr.ts";
 import { parseHerdrPaneLayout, type HerdrPaneLayout } from "../../pi-extension/subagents/pane-layout.ts";
-import {
-  formatLiveTestPreflightFailure,
-  preflightLiveTest,
-  type LiveTestPreflight,
-} from "../live-test-guard.ts";
 import { verifyDeployment } from "../../scripts/deploy-active-package.ts";
 
 // Re-export Herdr surface primitives for tests
@@ -84,12 +79,9 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
 // ── Backend detection ──
 
-/**
- * Detect Herdr only after the shared live-test preflight has authorized it.
- * This keeps accidental test runs from probing external infrastructure.
- */
-export function getAvailableBackends(preflight: LiveTestPreflight): string[] {
-  return preflight.status === "ready" && isMuxAvailable() ? ["herdr"] : [];
+/** Detect whether the invoking Pi session has an available Herdr backend. */
+export function getAvailableBackends(): string[] {
+  return isMuxAvailable() ? ["herdr"] : [];
 }
 
 export function getFocusedSurface(): string | null {
@@ -123,24 +115,12 @@ export function createTestEnv(): TestEnv {
   const agentsDir = join(dir, ".pi", "agents");
   mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into the project-local agents dir. A live
-  // suite must use its explicitly authorized model for nested Pi sessions too,
-  // rather than silently switching providers via fixture frontmatter.
-  const preflight = preflightLiveTest(process.env);
+  // Copy model-agnostic test agents. Parent and child Pi processes resolve the
+  // current configured model and credentials through the normal Pi paths.
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (!file.endsWith(".md")) continue;
-      const source = join(TEST_AGENTS_SRC, file);
-      const destination = join(agentsDir, file);
-      if (preflight.status !== "ready") {
-        cpSync(source, destination);
-        continue;
-      }
-      const definition = readFileSync(source, "utf8");
-      if (!/^model:\s*\S+/m.test(definition)) {
-        throw new Error(`Live test agent ${file} does not declare a model.`);
-      }
-      writeFileSync(destination, definition.replace(/^model:\s*\S+/m, `model: ${preflight.model}`));
+      cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
     }
   }
 
@@ -276,15 +256,6 @@ export function startPi(
   task: string,
   opts?: { extraArgs?: string },
 ): void {
-  const preflight = preflightLiveTest(process.env);
-  if (preflight.status === "disabled") {
-    throw new Error("Live test guard rejected: PI_LIVE_TESTS is missing.");
-  }
-  if (preflight.status === "rejected") {
-    throw new Error(formatLiveTestPreflightFailure(preflight));
-  }
-
-  const model = preflight.model;
   const extra = opts?.extraArgs ?? "";
 
   // Force pi to load the working-tree extension (not an installed pi-package
@@ -296,7 +267,6 @@ export function startPi(
     `pi`,
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
-    `--model ${shellEscape(model)}`,
     extra,
     shellEscape(task),
   ]
@@ -328,7 +298,6 @@ export interface DeployedPiCommandOptions {
   sessionDir: string;
   testDir: string;
   task: string;
-  model: string;
 }
 
 /** Build a normal auto-discovery command with no source or extension overrides. */
@@ -337,7 +306,6 @@ export function buildDeployedPiCommand(options: DeployedPiCommandOptions): strin
     agentDir: options.agentDir,
     sessionDir: options.sessionDir,
     testDir: options.testDir,
-    model: options.model,
   })) {
     if (!value || value.trim() === "") throw new Error(`Deployed Pi ${label} is required.`);
   }
@@ -346,19 +314,14 @@ export function buildDeployedPiCommand(options: DeployedPiCommandOptions): strin
     `PI_CODING_AGENT_DIR=${shellEscape(resolve(options.agentDir))}`,
     `PI_CODING_AGENT_SESSION_DIR=${shellEscape(resolve(options.sessionDir))}`,
     "pi",
-    `--model ${shellEscape(options.model)}`,
     shellEscape(options.task),
   ].join(" ");
 }
 
 /** Start a distinct Pi process through the active package ownership path. */
-export function startDeployedPi(surface: string, options: Omit<DeployedPiCommandOptions, "model">): void {
-  const preflight = preflightLiveTest(process.env);
-  if (preflight.status === "disabled") throw new Error("Live test guard rejected: PI_LIVE_TESTS is missing.");
-  if (preflight.status === "rejected") throw new Error(formatLiveTestPreflightFailure(preflight));
-
+export function startDeployedPi(surface: string, options: DeployedPiCommandOptions): void {
   mkdirSync(options.sessionDir, { recursive: true });
-  const command = buildDeployedPiCommand({ ...options, model: preflight.model });
+  const command = buildDeployedPiCommand(options);
   sendLongCommand(surface, `${command}; echo '__TEST_DONE_'$?'__'`, {
     scriptPath: join(options.testDir, `test-deployed-launch-${Date.now()}.sh`),
   });
